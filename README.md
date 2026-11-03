@@ -88,6 +88,9 @@ To update, install the new zip the same way.
 - Click the **Claude** button in the bar at the top of the 3D Viewport (next to
   View · Select · Add · Object). Click it again to hide the chat.
 - Type in the box at the bottom and press **Enter**, or click one of the example prompts.
+- **Long prompts:** copy them, then click the **Paste** button (clipboard icon) next to
+  **Send**. Blender's text box holds one line, but if you paste a long prompt into it with
+  Ctrl+V and send, crender notices and sends the whole thing.
 - When Claude wants to change something, its code appears with **Run** and **Reject**.
   To steer it, type what you want instead in the message box, then click **Reject**.
 - **Stop** cancels a reply. **New chat** starts over.

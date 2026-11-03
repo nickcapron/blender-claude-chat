@@ -260,6 +260,77 @@ def _tick():
 # ---------------------------------------------------------------------------
 
 
+_attachment = None  # long text added with the Paste button, sent with the next message
+
+
+def _clipboard(context):
+    try:
+        return context.window_manager.clipboard or ""
+    except Exception:
+        return ""
+
+
+def _summary(text):
+    lines = text.strip().splitlines()
+    first = lines[0].strip() if lines else ""
+    if len(first) > 70:
+        first = first[:67] + "..."
+    return first, len(lines)
+
+
+def expand_paste(typed, clipboard, attachment):
+    """Work out the full message to send, and a short version for the sidebar (or None).
+
+    Blender's text fields are single-line: pasting multi-line text with Ctrl+V keeps only
+    the first line. If what was typed is exactly the first line of a multi-line clipboard,
+    the user pasted it, so send the whole clipboard."""
+    if attachment:
+        msg = f"{typed}\n\n{attachment.strip()}" if typed else attachment.strip()
+    else:
+        clip = clipboard.strip()
+        clip_lines = clip.splitlines()
+        if typed and len(clip_lines) > 1 and clip_lines[0].strip() == typed:
+            msg = clip
+        else:
+            return typed, None
+    first, count = _summary(msg)
+    if count <= 3 and len(msg) <= 300:
+        return msg, None
+    lead = typed if (typed and attachment) else first
+    return msg, f"{lead}\n[+ pasted text, {count} lines]"
+
+
+class CLAUDE_OT_paste(bpy.types.Operator):
+    bl_idname = "claude.paste"
+    bl_label = "Paste"
+    bl_description = (
+        "Attach the text on your clipboard (any length, many lines) to your next message. "
+        "Use this for long prompts"
+    )
+
+    def execute(self, context):
+        global _attachment
+        text = _clipboard(context).strip()
+        if not text:
+            self.report({"WARNING"}, "The clipboard is empty. Copy some text first.")
+            return {"CANCELLED"}
+        _attachment = text
+        _redraw_all()
+        return {"FINISHED"}
+
+
+class CLAUDE_OT_clear_paste(bpy.types.Operator):
+    bl_idname = "claude.clear_paste"
+    bl_label = "Remove Pasted Text"
+    bl_description = "Don't send the pasted text"
+
+    def execute(self, context):
+        global _attachment
+        _attachment = None
+        _redraw_all()
+        return {"FINISHED"}
+
+
 class CLAUDE_OT_send(bpy.types.Operator):
     bl_idname = "claude.send"
     bl_label = "Send"
@@ -268,15 +339,17 @@ class CLAUDE_OT_send(bpy.types.Operator):
     text: StringProperty(options={"SKIP_SAVE"})
 
     def execute(self, context):
-        global _suppress_prompt_update
+        global _suppress_prompt_update, _attachment
         props = context.window_manager.claude_chat
-        msg = (self.text or props.prompt).strip()
-        if not msg:
+        typed = (self.text or props.prompt).strip()
+        if not typed and not _attachment:
             return {"CANCELLED"}
         if SESSION.busy:
             self.report({"WARNING"}, "Claude is still working. Stop it first or wait.")
             return {"CANCELLED"}
-        SESSION.send(msg, blender_tools.context_snapshot(), _build_cfg())
+        msg, display = expand_paste(typed, _clipboard(context), _attachment)
+        _attachment = None
+        SESSION.send(msg, blender_tools.context_snapshot(), _build_cfg(), display_text=display)
         _suppress_prompt_update = True
         try:
             props.prompt = ""
@@ -724,11 +797,21 @@ class VIEW3D_PT_claude_chat(bpy.types.Panel):
             row.label(text=status or "Working...", icon="SORTTIME")
             row.operator("claude.stop", text="Stop", icon="CANCEL")
 
-        row = layout.split(factor=0.75, align=True)
+        if _attachment:
+            box = layout.box()
+            first, count = _summary(_attachment)
+            row = box.row()
+            row.label(text=f"Pasted text: {count} line{'s' if count != 1 else ''}", icon="PASTEDOWN")
+            row.operator("claude.clear_paste", text="", icon="X")
+            box.label(text=first)
+            box.label(text="Add a note below if you like, then Send.", icon="INFO")
+
+        row = layout.split(factor=0.62, align=True)
         row.scale_y = 1.5
         row.prop(props, "prompt", text="", placeholder="Ask Claude anything...")
         sub = row.row(align=True)
         sub.enabled = not busy
+        sub.operator("claude.paste", text="", icon="PASTEDOWN")
         sub.operator("claude.send", text="Send")
 
         row = layout.row(align=True)
@@ -834,6 +917,8 @@ CLASSES = (
     CLAUDE_OT_open_chat,
     CLAUDE_OT_open_prefs,
     CLAUDE_OT_copy_chat,
+    CLAUDE_OT_paste,
+    CLAUDE_OT_clear_paste,
     VIEW3D_PT_claude_chat,
 )
 

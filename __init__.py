@@ -1,7 +1,7 @@
 bl_info = {
     "name": "crender: Claude Chat",
     "author": "Nick Capron",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > header > Claude button",
     "description": "Chat with Claude inside Blender and let it build, inspect and fix your scene",

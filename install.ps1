@@ -11,7 +11,7 @@
 
 $ErrorActionPreference = 'Stop'
 # The crender release this installs (a tag, so what's installed is what was released).
-$Release = 'v0.3.0'
+$Release = 'v0.3.1'
 $Repo = 'nickcapron/blender-claude-chat'
 $AddonFiles = @('__init__.py', 'ui.py', 'session.py', 'blender_tools.py', 'claude_code.py',
                 'bridge.py', 'mcp_bridge.py', 'install_deps.py', 'LICENSE', 'README.md')

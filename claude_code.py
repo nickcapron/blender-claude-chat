@@ -158,11 +158,13 @@ def run_turn(session, prompt, cfg):
                 et = e.get("type")
                 if et == "message_start":
                     saw_text_delta = False
+                    entry = None  # each model message gets its own bubble, in order with tool calls
                 elif et == "content_block_start":
                     kind = e.get("content_block", {}).get("type")
                     if kind == "thinking":
                         session._set_status("Thinking...")
                     elif kind == "tool_use":
+                        entry = None  # text after a tool call starts a new bubble
                         name = e["content_block"].get("name", "").replace("mcp__blender__", "")
                         session._set_status(f"Preparing {name}...")
                     elif kind == "text":
@@ -182,6 +184,7 @@ def run_turn(session, prompt, cfg):
                             session._set_status("Thinking: " + snippet)
             elif t == "assistant" and not saw_text_delta:
                 # No partial events for this message; show its text directly.
+                entry = None
                 for block in ev.get("message", {}).get("content", []):
                     if block.get("type") == "text" and block.get("text"):
                         if entry is None:

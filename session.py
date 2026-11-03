@@ -142,7 +142,7 @@ class ChatSession:
         for e in entries:
             role, text = e["role"], e["text"]
             if role == "user":
-                out += ["### You", "", text, ""]
+                out += ["### You", "", e.get("full", text), ""]
             elif role == "assistant":
                 out += ["### Claude", "", text, ""]
             elif role == "tool":
@@ -182,8 +182,9 @@ class ChatSession:
             return "\n\n".join(f"{labels.get(e['role'], e['role'])}: {e['text']}" for e in self.display)
 
     # -- public API -------------------------------------------------------
-    def send(self, user_text, context_line, cfg):
-        """Start a turn. cfg: backend, api_key, claude_path, model, effort, version, tools."""
+    def send(self, user_text, context_line, cfg, display_text=None):
+        """Start a turn. cfg: backend, api_key, claude_path, model, effort, version, tools.
+        display_text: a shorter version for the sidebar (e.g. for a long pasted prompt)."""
         if self.busy:
             return False
         self.cancel.clear()
@@ -191,7 +192,9 @@ class ChatSession:
             self.busy = True
             self.status = "Sending..."
             self._dirty = True
-        self._add("user", user_text)
+        entry = self._add("user", display_text or user_text)
+        if display_text:
+            entry["full"] = user_text
         prompt = f"<blender_context>{context_line}</blender_context>\n\n{user_text}"
         cfg = dict(cfg, system=SYSTEM_PROMPT.format(version=cfg["version"]))
         if cfg.get("backend") == "API":
