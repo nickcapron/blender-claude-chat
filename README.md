@@ -62,3 +62,7 @@ and hands back the result.
 - Chat history is kept in memory and cleared when Blender closes.
 - Claude's Python runs with full access to your Blender session and file system. Review code
   before approving, and only turn on **Auto-run code** if you trust what you're asking for.
+
+## License
+
+[MIT](LICENSE)
