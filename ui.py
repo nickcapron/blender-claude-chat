@@ -9,11 +9,10 @@ import gpu
 from bpy.props import BoolProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 from gpu_extras.batch import batch_for_shader
 
-from . import blender_tools
-from .session import ChatSession
+from . import blender_tools, bridge, claude_code
+from .session import SESSION
 
 ADDON_ID = __package__
-SESSION = ChatSession()
 TRANSCRIPT_TEXT = "Claude Chat Transcript"
 PENDING_TEXT = "Claude Pending Code"
 OVERLAY_LINGER = 20.0  # seconds the last reply stays on the overlay
@@ -36,6 +35,19 @@ def prefs():
 class ClaudeChatPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
+    backend: EnumProperty(
+        name="Connect with",
+        items=[
+            ("CLI", "Claude account", "Use your Claude subscription through your Claude Code install (claude login)"),
+            ("API", "API key", "Use an Anthropic API key (billed per token)"),
+        ],
+        default="CLI",
+    )
+    claude_path: StringProperty(
+        name="Claude Code path",
+        description="Path to the claude executable. Leave empty to find it automatically",
+        subtype="FILE_PATH",
+    )
     api_key: StringProperty(
         name="API Key",
         description="Anthropic API key. Leave empty to use the ANTHROPIC_API_KEY environment variable",
@@ -44,11 +56,12 @@ class ClaudeChatPreferences(bpy.types.AddonPreferences):
     model: EnumProperty(
         name="Model",
         items=[
-            ("claude-opus-5-5", "Claude Opus 5.5", "Most capable for building and scripting (default)"),
+            ("default", "Default", "Claude account: your Claude Code default model. API key: Claude Opus 5.5"),
+            ("claude-opus-5-5", "Claude Opus 5.5", "Most capable for building and scripting"),
             ("claude-sonnet-5-5", "Claude Sonnet 5.5", "Faster and cheaper"),
             ("claude-haiku-5-5", "Claude Haiku 5.5", "Fastest and cheapest"),
         ],
-        default="claude-opus-5-5",
+        default="default",
     )
     effort: EnumProperty(
         name="Effort",
@@ -71,8 +84,19 @@ class ClaudeChatPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         col = self.layout.column()
-        col.prop(self, "api_key")
-        col.label(text="Stored in your Blender preferences file. Leave empty to use ANTHROPIC_API_KEY.", icon="INFO")
+        col.row().prop(self, "backend", expand=True)
+        box = col.box()
+        if self.backend == "CLI":
+            found = claude_code.find_claude(self.claude_path)
+            box.prop(self, "claude_path")
+            if found:
+                box.label(text=f"Using {found}", icon="CHECKMARK")
+            else:
+                box.label(text="Claude Code not found. Install it, or set the path above.", icon="ERROR")
+            box.label(text="Log in once by running `claude` in a terminal with your Claude account.", icon="INFO")
+        else:
+            box.prop(self, "api_key")
+            box.label(text="Stored in your Blender preferences file. Leave empty to use ANTHROPIC_API_KEY.", icon="INFO")
         col.separator()
         row = col.row()
         row.prop(self, "model")
@@ -171,9 +195,14 @@ def _write_text_block(name, body, show=True):
 
 def _build_cfg():
     p = prefs()
+    model = p.model
+    if p.backend == "API" and model == "default":
+        model = "claude-opus-5-5"
     return {
+        "backend": p.backend,
+        "claude_path": bpy.path.abspath(p.claude_path) if p.claude_path else "",
         "api_key": p.api_key.strip(),
-        "model": p.model,
+        "model": model,
         "effort": p.effort,
         "version": bpy.app.version_string,
         "tools": blender_tools.TOOL_DEFS,
@@ -467,7 +496,8 @@ class VIEW3D_PT_claude_chat(bpy.types.Panel):
             col.scale_y = 0.7
             col.enabled = False
             col.label(
-                text=f"{p.model}  in {u['input'] + u['cache_read'] + u['cache_write']:,} "
+                text=f"{'Claude account' if p.backend == 'CLI' else p.model}  "
+                f"in {u['input'] + u['cache_read'] + u['cache_write']:,} "
                 f"(cached {u['cache_read']:,})  out {u['output']:,}"
             )
 
@@ -562,6 +592,7 @@ def register():
     bpy.types.WindowManager.claude_chat = PointerProperty(type=ClaudeChatProps)
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(_draw_overlay, (), "WINDOW", "POST_PIXEL")
     bpy.app.timers.register(_tick, persistent=True)
+    bridge.start()
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
@@ -576,6 +607,7 @@ def unregister():
     if SESSION.pending is not None:
         SESSION.pending.finish("Add-on was disabled.", True)
         SESSION.pending = None
+    bridge.stop()
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     if _draw_handle is not None:

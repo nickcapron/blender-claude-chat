@@ -11,7 +11,6 @@ import threading
 import time
 import traceback
 
-import anthropic
 
 MAX_TOOL_ROUNDS = 40
 MAX_TOKENS = 64000
@@ -79,6 +78,8 @@ class ChatSession:
         self.usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self._dirty = True
         self._thread = None
+        self.cli_session_id = None  # Claude Code session to resume (account mode)
+        self.proc = None  # running Claude Code process (account mode)
 
     # -- display helpers (thread-safe) ------------------------------------
     def _add(self, role, text):
@@ -116,6 +117,7 @@ class ChatSession:
             return False
         with self.lock:
             self.messages.clear()
+            self.cli_session_id = None
             self.display.clear()
             self.status = ""
             self.usage = {k: 0 for k in self.usage}
@@ -129,7 +131,7 @@ class ChatSession:
 
     # -- public API -------------------------------------------------------
     def send(self, user_text, context_line, cfg):
-        """Start a turn. cfg: api_key, model, effort, version."""
+        """Start a turn. cfg: backend, api_key, claude_path, model, effort, version, tools."""
         if self.busy:
             return False
         self.cancel.clear()
@@ -138,27 +140,54 @@ class ChatSession:
             self.status = "Sending..."
             self._dirty = True
         self._add("user", user_text)
-        self.messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"<blender_context>{context_line}</blender_context>\n\n{user_text}",
-                    }
-                ],
-            }
-        )
-        self._thread = threading.Thread(target=self._run, args=(cfg,), daemon=True)
+        prompt = f"<blender_context>{context_line}</blender_context>\n\n{user_text}"
+        cfg = dict(cfg, system=SYSTEM_PROMPT.format(version=cfg["version"]))
+        if cfg.get("backend") == "API":
+            self.messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+            target, args = self._run, (cfg,)
+        else:
+            target, args = self._run_cli, (prompt, cfg)
+        self._thread = threading.Thread(target=target, args=args, daemon=True)
         self._thread.start()
         return True
 
     def stop(self):
         self.cancel.set()
         self._set_status("Stopping...")
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
     # -- worker -----------------------------------------------------------
+    def _finish(self):
+        with self.lock:
+            self.busy = False
+            self.status = ""
+            self.finished_at = time.time()
+            self._dirty = True
+
+    def _run_cli(self, prompt, cfg):
+        from . import claude_code
+
+        try:
+            claude_code.run_turn(self, prompt, cfg)
+        except Exception:
+            self._add("error", "Unexpected error:\n" + traceback.format_exc(limit=4))
+        finally:
+            self._finish()
+
     def _run(self, cfg):
+        try:
+            import anthropic  # only needed in API-key mode (installed by install_deps.py)
+        except ImportError:
+            self._add(
+                "error",
+                "API-key mode needs the anthropic package. Run:\n"
+                "blender --background --python <add-on folder>/install_deps.py\n"
+                "or switch to 'Claude account' in the add-on preferences.",
+            )
+            self._finish()
+            return
         try:
             client = anthropic.Anthropic(api_key=cfg.get("api_key") or None, max_retries=3)
             self._loop(client, cfg)
@@ -186,18 +215,14 @@ class ChatSession:
         except Exception:
             self._add("error", "Unexpected error:\n" + traceback.format_exc(limit=4))
         finally:
-            with self.lock:
-                self.busy = False
-                self.status = ""
-                self.finished_at = time.time()
-                self._dirty = True
+            self._finish()
 
     def _request_kwargs(self, cfg):
         model = cfg["model"]
         kwargs = dict(
             model=model,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT.format(version=cfg["version"]),
+            system=cfg["system"],
             tools=cfg["tools"],
             messages=self.messages,
             thinking={"type": "adaptive", "display": "summarized"},
@@ -299,37 +324,47 @@ class ChatSession:
         self._add("info", f"Stopped after {MAX_TOOL_ROUNDS} tool rounds. Say 'continue' to keep going.")
 
     def _run_tool(self, block, truncated):
+        if truncated:
+            content, is_error = "Tool input was cut off by the output length limit; not run. Use smaller steps.", True
+            self._add("tool", f"-> {block.name}  [x] {content}")
+        else:
+            content, is_error = self.execute_tool(block.name, block.input)
+        r = {"type": "tool_result", "tool_use_id": block.id, "content": content}
+        if is_error:
+            r["is_error"] = True
+        return r
+
+    def execute_tool(self, name, args):
+        """Validate, show in the chat, and run a tool on Blender's main thread (waiting for
+        approval if needed). Called from a worker or bridge thread. Returns (content, is_error)."""
         from . import blender_tools  # validate() doesn't touch bpy state
 
-        args = block.input
-        label = block.name
-        if block.name == "execute_python" and isinstance(args, dict):
+        label = name
+        if name == "execute_python" and isinstance(args, dict):
             label = f"run code: {args.get('summary') or '...'}"
-        elif block.name == "get_object_details" and isinstance(args, dict):
+        elif name == "get_object_details" and isinstance(args, dict):
             label = f"inspect {args.get('name')!r}"
         tool_entry = self._add("tool", f"-> {label}")
 
-        def result(content, is_error):
+        def done(content, is_error):
             mark = "x" if is_error else "ok"
             preview = content if isinstance(content, str) else "image"
             preview = " ".join(preview.split())[:160]
             self._append_text(tool_entry, f"  [{mark}] {preview}")
-            r = {"type": "tool_result", "tool_use_id": block.id, "content": content}
-            if is_error:
-                r["is_error"] = True
-            return r
+            return content, is_error
 
-        if truncated:
-            return result("Tool input was cut off by the output length limit; not run. Use smaller steps.", True)
         if self.cancel.is_set():
-            return result("Cancelled by the user.", True)
-        err = blender_tools.validate(block.name, args)
+            return done("Cancelled by the user.", True)
+        err = blender_tools.validate(name, args)
         if err:
-            return result(f"INVALID_INPUT: {err} Input was: {json.dumps(args, default=str)[:500]}", True)
+            return done(f"INVALID_INPUT: {err} Input was: {json.dumps(args, default=str)[:500]}", True)
 
-        self._set_status(f"Running {block.name}...")
-        call = ToolCall(block.id, block.name, args)
+        self._set_status(f"Running {name}...")
+        call = ToolCall(None, name, args)
         self.calls.put(call)
-        while not call.done.wait(0.1):
-            pass  # the main thread always finishes calls (stop() rejects pending ones)
-        return result(call.content, call.is_error)
+        call.done.wait()  # the main thread always finishes calls (stop() rejects pending ones)
+        self._set_status("Thinking...")
+        return done(call.content, call.is_error)
+
+
+SESSION = ChatSession()
