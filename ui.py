@@ -75,7 +75,13 @@ class ClaudeChatPreferences(bpy.types.AddonPreferences):
         ],
         default="medium",
     )
-    messages_shown: IntProperty(name="Messages shown in sidebar", default=10, min=2, max=60)
+    messages_shown: IntProperty(name="Messages shown in sidebar", default=6, min=2, max=60)
+    show_header_button: BoolProperty(
+        name="Show Claude button in the 3D Viewport header",
+        default=True,
+        update=lambda self, ctx: _redraw_all(),
+    )
+    welcomed: BoolProperty(default=False, options={"HIDDEN"})  # chat opened once on first enable
     send_on_enter: BoolProperty(
         name="Send on Enter",
         description="Send the message when you confirm the text field",
@@ -103,7 +109,9 @@ class ClaudeChatPreferences(bpy.types.AddonPreferences):
         row.prop(self, "effort")
         col.prop(self, "messages_shown")
         col.prop(self, "send_on_enter")
+        col.prop(self, "show_header_button")
         col.separator()
+        col.label(text="Open the chat with the Claude button at the top of the 3D Viewport.", icon="INFO")
         col.label(text="Shortcut: F7 in the 3D Viewport opens a quick prompt.", icon="EVENT_F7")
 
 
@@ -368,6 +376,74 @@ class CLAUDE_OT_reject(bpy.types.Operator):
         return {"FINISHED"}
 
 
+_cli_version_cache = {}
+
+
+def _claude_code_version(exe):
+    if not exe:
+        return "not found"
+    if exe not in _cli_version_cache:
+        import subprocess
+        import sys
+
+        try:
+            out = subprocess.run(
+                [exe, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            _cli_version_cache[exe] = (out.stdout or out.stderr).strip().splitlines()[0][:80]
+        except Exception as e:
+            _cli_version_cache[exe] = f"unknown ({e.__class__.__name__})"
+    return _cli_version_cache[exe]
+
+
+def _environment(context):
+    import os
+    import platform
+    import sys
+
+    p = prefs()
+    addon = sys.modules.get(ADDON_ID)
+    version = ".".join(map(str, getattr(addon, "bl_info", {}).get("version", ("?",))))
+    env = [
+        ("crender", version),
+        ("Blender", bpy.app.version_string),
+        ("OS", platform.platform()),
+        ("Connect with", "Claude account (Claude Code)" if p.backend == "CLI" else "API key"),
+    ]
+    if p.backend == "CLI":
+        exe = claude_code.find_claude(bpy.path.abspath(p.claude_path) if p.claude_path else "")
+        env.append(("Claude Code", _claude_code_version(exe)))
+    env += [
+        ("Model", "Claude Code default" if _build_cfg()["model"] == "default" else _build_cfg()["model"]),
+        ("Effort", p.effort),
+        ("Auto-run code", "on" if context.window_manager.claude_chat.auto_run else "off"),
+        ("File", os.path.basename(bpy.data.filepath) or "(unsaved)"),
+    ]
+    return env
+
+
+class CLAUDE_OT_copy_chat(bpy.types.Operator):
+    bl_idname = "claude.copy_chat"
+    bl_label = "Copy Chat"
+    bl_description = (
+        "Copy the whole chat, including the code Claude ran and its output, so you can paste it "
+        "into a message or bug report"
+    )
+
+    def execute(self, context):
+        display, _, _ = SESSION.snapshot()
+        if not display:
+            self.report({"INFO"}, "Nothing to copy yet.")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = SESSION.export_markdown(_environment(context))
+        self.report({"INFO"}, "Chat copied. Paste it anywhere with Ctrl+V.")
+        return {"FINISHED"}
+
+
 class CLAUDE_OT_show_text(bpy.types.Operator):
     bl_idname = "claude.show_text"
     bl_label = "Open in Text Editor"
@@ -388,8 +464,156 @@ class CLAUDE_OT_show_text(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Opening the chat: header button, first-run, F-key
+# ---------------------------------------------------------------------------
+
+
+def _find_view3d(context):
+    if context.area and context.area.type == "VIEW_3D":
+        return context.area
+    win = context.window or (context.window_manager.windows[0] if context.window_manager.windows else None)
+    if win:
+        for area in win.screen.areas:
+            if area.type == "VIEW_3D":
+                return area
+    return None
+
+
+def _sidebar(area):
+    return next((r for r in area.regions if r.type == "UI"), None)
+
+
+def _select_claude_tab(area, tries=20):
+    """Switch the sidebar to the Claude tab. A sidebar that was just opened has no tabs until it
+    has drawn once, so retry briefly."""
+    try:
+        region = _sidebar(area)
+        region.active_panel_category = "Claude"
+        area.tag_redraw()
+        return
+    except ReferenceError:
+        return  # area went away
+    except Exception:
+        pass
+    if tries > 0:
+        bpy.app.timers.register(lambda: _select_claude_tab(area, tries - 1), first_interval=0.05)
+
+
+def _chat_is_open(area):
+    try:
+        region = _sidebar(area)
+        return area.spaces.active.show_region_ui and region and region.active_panel_category == "Claude"
+    except Exception:
+        return False
+
+
+def open_chat(area):
+    area.spaces.active.show_region_ui = True
+    area.tag_redraw()
+    _select_claude_tab(area)
+
+
+class CLAUDE_OT_open_chat(bpy.types.Operator):
+    bl_idname = "claude.open_chat"
+    bl_label = "Claude"
+    bl_description = "Open the Claude chat in the sidebar (click again to hide it)"
+
+    toggle: BoolProperty(default=True, options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        area = _find_view3d(context)
+        if area is None:
+            self.report({"WARNING"}, "Open a 3D Viewport to chat with Claude.")
+            return {"CANCELLED"}
+        if self.toggle and _chat_is_open(area):
+            area.spaces.active.show_region_ui = False
+        else:
+            open_chat(area)
+        return {"FINISHED"}
+
+
+def _draw_header_button(self, context):
+    try:
+        if not prefs().show_header_button:
+            return
+    except KeyError:
+        return
+    area = context.area
+    is_open = bool(area) and _chat_is_open(area)
+    label = "Claude"
+    if SESSION.pending is not None:
+        label = "Claude: approve code"
+    elif SESSION.busy:
+        label = "Claude: working..."
+    row = self.layout.row(align=True)
+    row.alert = SESSION.pending is not None
+    row.operator("claude.open_chat", text=label, icon="LIGHT", depress=is_open)
+
+
+def _first_run():
+    try:
+        p = prefs()
+    except KeyError:
+        return None
+    if p.welcomed or bpy.app.background:
+        return None
+    area = _find_view3d(bpy.context)
+    if area is None:
+        return 1.0  # no viewport yet (e.g. still on the splash); try again shortly
+    open_chat(area)
+    p.welcomed = True
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Sidebar panel
 # ---------------------------------------------------------------------------
+
+EXAMPLES = [
+    ("What's in my scene?", "What's in my scene? Give me a short overview."),
+    ("Add a low-poly tree", "Add a simple low-poly tree next to the existing objects."),
+    ("Make the cube red and shiny", "Give the selected object a glossy red material."),
+    ("Set up nice lighting", "Set up a simple three-point lighting rig for the scene."),
+]
+
+_setup_cache = {"t": 0.0, "msg": None}
+
+
+def _setup_problem():
+    """A short message if chatting can't work yet, else None. Cached; called on every redraw."""
+    now = time.time()
+    if now - _setup_cache["t"] < 5:
+        return _setup_cache["msg"]
+    p = prefs()
+    msg = None
+    if p.backend == "CLI":
+        if not claude_code.find_claude(bpy.path.abspath(p.claude_path) if p.claude_path else ""):
+            msg = (
+                "Claude Code isn't installed (or wasn't found). Install it from claude.com/claude-code, "
+                "run `claude` once in a terminal to log in, then come back here."
+            )
+    else:
+        import importlib.util
+        import os
+
+        if importlib.util.find_spec("anthropic") is None:
+            msg = "API-key mode needs setup: run install_deps.py (see the README), or switch to 'Claude account' in the add-on preferences."
+        elif not p.api_key.strip() and not os.environ.get("ANTHROPIC_API_KEY"):
+            msg = "Add your API key in the add-on preferences, or switch to 'Claude account'."
+    _setup_cache.update(t=now, msg=msg)
+    return msg
+
+
+class CLAUDE_OT_open_prefs(bpy.types.Operator):
+    bl_idname = "claude.open_prefs"
+    bl_label = "Open Settings"
+    bl_description = "Open the Claude Chat add-on preferences"
+
+    def execute(self, context):
+        bpy.ops.screen.userpref_show(section="ADDONS")
+        context.preferences.active_section = "ADDONS"
+        context.window_manager.addon_search = "Claude Chat"
+        return {"FINISHED"}
 
 ROLE_ICONS = {"user": "USER", "assistant": "LIGHT", "tool": "TOOL_SETTINGS", "error": "ERROR", "info": "INFO"}
 
@@ -402,6 +626,7 @@ class VIEW3D_PT_claude_chat(bpy.types.Panel):
 
     def draw_header_preset(self, context):
         row = self.layout.row(align=True)
+        row.operator("claude.copy_chat", text="", icon="COPYDOWN")
         row.operator("claude.show_text", text="", icon="TEXT").what = "TRANSCRIPT"
         row.operator("claude.clear", text="", icon="FILE_NEW")
 
@@ -417,13 +642,33 @@ class VIEW3D_PT_claude_chat(bpy.types.Panel):
         # because Blender's label font metrics differ slightly from blf's.
         wrap_px = max(80, (context.region.width - 80 * scale) * 0.92)
 
+        problem = _setup_problem()
+        if problem:
+            box = layout.box()
+            box.alert = True
+            col = box.column(align=True)
+            for i, line in enumerate(_wrap(problem, wrap_px, text_size)):
+                col.label(text=line, icon="ERROR" if i == 0 else "BLANK1")
+            box.operator("claude.open_prefs", icon="PREFERENCES")
+
         if not display:
             box = layout.box()
             col = box.column(align=True)
-            col.label(text="Ask Claude to build, inspect", icon="LIGHT")
-            col.label(text="or fix things in your scene.")
-            col.label(text='e.g. "Add a low-poly tree"')
-            col.label(text='or "Why is my render black?"')
+            intro = (
+                "Hi! I can build, change and explain things in your scene. Type below and press "
+                "Enter, or try one of these:"
+            )
+            for i, line in enumerate(_wrap(intro, wrap_px, text_size)):
+                col.label(text=line, icon="LIGHT" if i == 0 else "BLANK1")
+            col.separator()
+            for label, prompt in EXAMPLES:
+                op = col.operator("claude.send", text=label, icon="RIGHTARROW_THIN")
+                op.text = prompt
+            col.separator()
+            for i, line in enumerate(
+                _wrap("I'll ask before running any code, and Ctrl+Z undoes my changes.", wrap_px, text_size)
+            ):
+                col.label(text=line, icon="INFO" if i == 0 else "BLANK1")
 
         shown = display[-p.messages_shown:]
         if len(display) > len(shown):
@@ -477,18 +722,23 @@ class VIEW3D_PT_claude_chat(bpy.types.Panel):
         if busy:
             row = layout.row()
             row.label(text=status or "Working...", icon="SORTTIME")
-            row.operator("claude.stop", text="", icon="CANCEL")
+            row.operator("claude.stop", text="Stop", icon="CANCEL")
 
-        row = layout.row(align=True)
-        row.scale_y = 1.4
-        row.prop(props, "prompt", text="")
+        row = layout.split(factor=0.75, align=True)
+        row.scale_y = 1.5
+        row.prop(props, "prompt", text="", placeholder="Ask Claude anything...")
         sub = row.row(align=True)
         sub.enabled = not busy
-        sub.operator("claude.send", text="", icon="PLAY")
+        sub.operator("claude.send", text="Send")
 
         row = layout.row(align=True)
         row.prop(props, "auto_run", toggle=True, icon="SCRIPT")
         row.prop(props, "show_overlay", text="Overlay", toggle=True, icon="OVERLAY")
+
+        if display:
+            row = layout.row(align=True)
+            row.operator("claude.copy_chat", text="Copy chat", icon="COPYDOWN")
+            row.operator("claude.clear", text="New chat", icon="FILE_NEW")
 
         u = SESSION.usage
         if u["input"] or u["output"]:
@@ -531,7 +781,7 @@ def _draw_overlay():
 
     header = "Claude"
     if pending:
-        header = "Claude wants to run code - approve in the sidebar (N > Claude)"
+        header = "Claude wants to run code - click the Claude button at the top to review it"
     elif busy:
         header = f"Claude: {status or 'working...'}"
     lines = [(header, (1.0, 0.75, 0.45, 1.0) if pending else (0.85, 0.8, 1.0, 1.0))]
@@ -581,6 +831,9 @@ CLASSES = (
     CLAUDE_OT_approve,
     CLAUDE_OT_reject,
     CLAUDE_OT_show_text,
+    CLAUDE_OT_open_chat,
+    CLAUDE_OT_open_prefs,
+    CLAUDE_OT_copy_chat,
     VIEW3D_PT_claude_chat,
 )
 
@@ -593,6 +846,8 @@ def register():
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(_draw_overlay, (), "WINDOW", "POST_PIXEL")
     bpy.app.timers.register(_tick, persistent=True)
     bridge.start()
+    bpy.types.VIEW3D_MT_editor_menus.append(_draw_header_button)
+    bpy.app.timers.register(_first_run, first_interval=0.5)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
@@ -608,6 +863,9 @@ def unregister():
         SESSION.pending.finish("Add-on was disabled.", True)
         SESSION.pending = None
     bridge.stop()
+    bpy.types.VIEW3D_MT_editor_menus.remove(_draw_header_button)
+    if bpy.app.timers.is_registered(_first_run):
+        bpy.app.timers.unregister(_first_run)
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     if _draw_handle is not None:

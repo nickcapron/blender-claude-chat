@@ -1,10 +1,12 @@
 bl_info = {
-    "name": "Claude Chat",
-    "author": "crender",
-    "version": (0, 1, 0),
+    "name": "crender: Claude Chat",
+    "author": "Nick Capron",
+    "version": (0, 3, 0),
     "blender": (4, 2, 0),
-    "location": "3D Viewport > Sidebar (N) > Claude",
-    "description": "Chat with Claude inside Blender and let it inspect and edit your scene",
+    "location": "3D Viewport > header > Claude button",
+    "description": "Chat with Claude inside Blender and let it build, inspect and fix your scene",
+    "doc_url": "https://github.com/nickcapron/blender-claude-chat",
+    "tracker_url": "https://github.com/nickcapron/blender-claude-chat/issues",
     "category": "Interface",
 }
 

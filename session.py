@@ -124,6 +124,58 @@ class ChatSession:
             self._dirty = True
         return True
 
+    def export_markdown(self, environment):
+        """The whole chat, including every tool call's input and output, as Markdown that reads
+        well when pasted into a chat or an issue. environment: list of (label, value)."""
+        with self.lock:
+            entries = [dict(e) for e in self.display]
+            pending = self.pending
+            usage = dict(self.usage)
+        out = ["## crender chat export", ""]
+        out += [f"- **{k}:** {v}" for k, v in environment]
+        if usage["input"] or usage["output"]:
+            out.append(
+                f"- **Tokens:** in {usage['input'] + usage['cache_read'] + usage['cache_write']:,} "
+                f"(cached {usage['cache_read']:,}), out {usage['output']:,}"
+            )
+        out.append("")
+        for e in entries:
+            role, text = e["role"], e["text"]
+            if role == "user":
+                out += ["### You", "", text, ""]
+            elif role == "assistant":
+                out += ["### Claude", "", text, ""]
+            elif role == "tool":
+                d = e.get("detail")
+                if not d:
+                    out += [f"> **Tool:** {text}", ""]
+                    continue
+                status = "error" if d["is_error"] else "ok"
+                out.append(f"**Tool `{d['name']}`** ({status})")
+                args = d["input"] if isinstance(d["input"], dict) else {"input": d["input"]}
+                code = args.get("code")
+                rest = {k: v for k, v in args.items() if k != "code"}
+                if rest:
+                    out.append(f"- input: `{json.dumps(rest, default=str)}`")
+                if code:
+                    out += ["", "```python", code.rstrip(), "```"]
+                output = d["output"].rstrip()
+                try:  # compact JSON (scene summaries) so pasted chats stay readable
+                    output = json.dumps(json.loads(output), separators=(",", ":"))
+                    if len(output) > 2500:
+                        output = output[:2500] + " ...(truncated)"
+                except ValueError:
+                    pass
+                out += ["", "<details><summary>output</summary>", "", "```", output, "```", "", "</details>", ""]
+            elif role == "error":
+                out += [f"> **Error:** {text}", ""]
+            else:
+                out += [f"> {text}", ""]
+        if pending is not None:
+            out += ["**Waiting for approval:** " + pending.args.get("summary", ""), "",
+                    "```python", pending.args.get("code", "").rstrip(), "```", ""]
+        return "\n".join(out).rstrip() + "\n"
+
     def transcript(self):
         with self.lock:
             labels = {"user": "You", "assistant": "Claude", "tool": "  [tool]", "error": "  [error]", "info": "  [info]"}
@@ -348,8 +400,15 @@ class ChatSession:
 
         def done(content, is_error):
             mark = "x" if is_error else "ok"
-            preview = content if isinstance(content, str) else "image"
-            preview = " ".join(preview.split())[:160]
+            if isinstance(content, str):
+                full = content
+            else:  # list of blocks, e.g. a screenshot
+                full = "\n".join(
+                    b.get("text", "") if b.get("type") == "text" else f"[{b.get('type')}]" for b in content
+                )
+            preview = " ".join(full.split())[:160]
+            with self.lock:
+                tool_entry["detail"] = {"name": name, "input": args, "output": full[:6000], "is_error": is_error}
             self._append_text(tool_entry, f"  [{mark}] {preview}")
             return content, is_error
 
