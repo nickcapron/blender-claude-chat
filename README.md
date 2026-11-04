@@ -32,7 +32,7 @@ one undo step, so **Ctrl+Z undoes anything Claude did**.
 | **See your scene** | Objects, transforms, collections, selection, frame range, render settings |
 | **Inspect objects** | Mesh stats, modifiers and their settings, material node setups, lights, cameras, animation, custom properties |
 | **Make changes** | Anything Blender Python can do: modeling, materials, lighting, cameras, modifiers, animation, scene setup |
-| **Check its work** | Takes a screenshot of the 3D Viewport and looks at it |
+| **Check its work** | Takes a screenshot of the 3D Viewport and looks at it, and looks at renders, saved images and baked textures. Checks that looping animations actually line up at the loop point |
 | **Know what you mean** | Every message includes your mode, selection and frame, so "make this red" works |
 
 ## Install

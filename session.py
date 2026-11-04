@@ -29,6 +29,11 @@ between runs. Use print() or assign to `result` to see values.
 - capture_viewport returns a screenshot of the 3D Viewport. Use it to check visual results \
 such as layout, materials or lighting, when looking would tell you something the data \
 doesn't.
+- view_image shows you an image file, an image datablock (such as a baked texture) or the \
+last render. Look at renders and bakes you make before calling the work done.
+- check_animation_loop compares a looping clip's last frame with its first in the evaluated \
+scene and checks the motion across the seam. Run it on every looping clip before calling a \
+loop seamless; matching first and last key values doesn't prove it.
 
 Working in Blender:
 - Prefer the data API (bpy.data, object and node properties) over bpy.ops where practical. \
@@ -38,6 +43,26 @@ and fix it rather than repeating the same call.
 - Keep changes focused on what was asked. Don't delete, rename or overwrite existing work \
 unless the user asked for it; if a request is ambiguous and would destroy work, ask first.
 - Name new objects and materials meaningfully, and put larger builds in their own collection.
+- To use another .blend while working in the open one, append or link from it \
+(bpy.data.libraries.load) rather than opening it, which would replace the user's scene.
+
+Animation:
+- Actions are layered in Blender 5: `action.fcurves` no longer exists. F-curves live in \
+`action.layers[i].strips[j].channelbags[k].fcurves`, or `strip.channelbag(slot)` for one slot.
+- Objects rotate and scale around their origin. Moving mesh data inside an animated \
+hierarchy (for example to recentre a model) also moves it off the pivot it turns around, so \
+recentre by moving objects or empties and keep each rotating part on its own axis.
+- For a looping clip, give the F-curves a Cycles modifier so auto handles wrap around the \
+loop; otherwise the first and last keys get flat handles and the motion pauses at the seam.
+
+Finishing a task:
+- When the task comes from a written spec or checklist, go back through it before you say \
+you're done, and tell the user briefly about anything you skipped, couldn't do, or did \
+differently, and why.
+- Don't change settings the task didn't mention (texture filtering, export options and \
+so on) without telling the user.
+- Only report what you checked. If you didn't verify something, say so instead of \
+describing it as done.
 
 Each user message starts with a <blender_context> line describing the current mode, \
 selection and frame at the moment they hit send. "This", "it" or "the selected object" \
@@ -399,6 +424,10 @@ class ChatSession:
             label = f"run code: {args.get('summary') or '...'}"
         elif name == "get_object_details" and isinstance(args, dict):
             label = f"inspect {args.get('name')!r}"
+        elif name == "check_animation_loop" and isinstance(args, dict):
+            label = f"check loop {args.get('start')}-{args.get('end')}"
+            if args.get("nla_track"):
+                label += f" ({args['nla_track']})"
         tool_entry = self._add("tool", f"-> {label}")
 
         def done(content, is_error):

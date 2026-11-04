@@ -14,7 +14,7 @@ import traceback
 
 import bpy
 
-MAX_OUTPUT_CHARS = 8000
+MAX_OUTPUT_CHARS = 20000  # Claude Code caps a tool result at about 25k tokens
 MAX_IMAGE_EDGE = 1568
 
 # ---------------------------------------------------------------------------
@@ -86,13 +86,69 @@ TOOL_DEFS = [
         "name": "capture_viewport",
         "description": (
             "Take a screenshot of the 3D Viewport exactly as the user sees it, to check your "
-            "work visually."
+            "work visually. If the screenshot comes back black, an offscreen render of the "
+            "viewport is returned instead and the result says so."
         ),
         "eager_input_streaming": True,
         "input_schema": {
             "type": "object",
             "properties": {},
             "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "view_image",
+        "description": (
+            "Look at an image by eye: a file on disk (such as a render you saved), an image "
+            "datablock by name (such as a texture you baked), or, with neither, the last "
+            "render in Blender's Render Result. Use it to check renders and bakes; "
+            "capture_viewport shows the viewport instead."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path of an image file to view."},
+                "image": {
+                    "type": "string",
+                    "description": "Name of an image in bpy.data.images to view.",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "check_animation_loop",
+        "description": (
+            "Check that a looping animation is seamless, using the evaluated scene rather than "
+            "key values. Compares each object's geometry at the end frame with the start frame "
+            "(nearest-vertex distance, so symmetric parts that rotate onto each other count as "
+            "matching), and checks the motion across the seam for jumps and stalls (end keys "
+            "with flat handles). Pass the frame where the loop starts and the frame whose pose "
+            "should equal it. Restores the frame and NLA mute states afterwards."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "integer", "description": "First frame of the loop."},
+                "end": {
+                    "type": "integer",
+                    "description": "Frame whose pose should equal the start frame (e.g. 73 for a 72-frame loop starting at 1).",
+                },
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Objects to check (default: all visible meshes).",
+                },
+                "nla_track": {
+                    "type": "string",
+                    "description": "Play only the NLA tracks with this name during the check (e.g. 'idle').",
+                },
+            },
+            "required": ["start", "end"],
             "additionalProperties": False,
         },
     },
@@ -121,6 +177,24 @@ def validate(name, args):
             return f"SyntaxError: {e}"
     elif name == "capture_viewport":
         pass
+    elif name == "view_image":
+        for key in ("path", "image"):
+            if key in args and (not isinstance(args[key], str) or not args[key]):
+                return f"{key} must be a non-empty string."
+        if args.get("path") and args.get("image"):
+            return "Pass either path or image, not both."
+    elif name == "check_animation_loop":
+        s, e = args.get("start"), args.get("end")
+        if not isinstance(s, int) or not isinstance(e, int) or isinstance(s, bool) or isinstance(e, bool):
+            return "start and end must be integers."
+        if e - s < 8:
+            return "The loop must be at least 8 frames long (end - start >= 8)."
+        objs = args.get("objects")
+        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
+            return "objects must be a list of object names."
+        tr = args.get("nla_track")
+        if tr is not None and (not isinstance(tr, str) or not tr):
+            return "nla_track must be a non-empty string."
     else:
         return f"Unknown tool: {name}"
     return None
@@ -445,10 +519,16 @@ def execute_python(args):
 
     out = buf.getvalue()
     res = ns.get("result")
-    if res is not None:
+    # Skip `result` when it was also printed (e.g. a file read and printed), so long
+    # text isn't sent twice and cut in half by the limit below.
+    if res is not None and not (isinstance(res, str) and res.strip() and res.strip() in out):
         out += f"\nresult = {res!r}"
     if len(out) > MAX_OUTPUT_CHARS:
-        out = out[:2000] + "\n... (output truncated) ...\n" + out[-(MAX_OUTPUT_CHARS - 2000):]
+        head = MAX_OUTPUT_CHARS // 3
+        tail = MAX_OUTPUT_CHARS - head
+        cut = len(out) - head - tail
+        out = (out[:head] + f"\n... ({cut:,} characters cut from the middle; print smaller "
+               f"pieces to see them) ...\n" + out[-tail:])
     status = "OK" if ok else "ERROR"
     text = f"[{status}] ran in {elapsed:.2f}s\n{out.strip() or '(no output)'}"
     if not ok:
@@ -456,49 +536,326 @@ def execute_python(args):
     return text
 
 
+def _temp_png(tag):
+    return os.path.join(tempfile.gettempdir(), f"claude_{tag}_{os.getpid()}.png")
+
+
+def _remove_file(path):
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
+def _mostly_black(img):
+    """True if nearly every pixel of a loaded image is black (a failed capture)."""
+    import numpy as np
+
+    w, h = img.size
+    ch = img.channels
+    if not w or not h or not ch:
+        return True
+    px = np.empty(w * h * ch, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    rgb = px.reshape(-1, ch)[:, : min(ch, 3)]
+    return float((rgb.max(axis=1) > 0.02).mean()) < 0.01
+
+
+def _is_black_file(path):
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        return _mostly_black(img)
+    finally:
+        bpy.data.images.remove(img)
+
+
+def _png_blocks(src, out, caption):
+    """Load the image at src, shrink it to MAX_IMAGE_EDGE, write it to out as PNG and
+    return it as tool-result blocks. src is never modified unless it equals out."""
+    img = bpy.data.images.load(src, check_existing=False)
+    try:
+        w, h = img.size
+        if not w or not h:
+            raise RuntimeError(f"Could not read image data from {src}.")
+        black = _mostly_black(img)
+        longest = max(w, h)
+        if longest > MAX_IMAGE_EDGE:
+            s = MAX_IMAGE_EDGE / longest
+            img.scale(max(1, round(w * s)), max(1, round(h * s)))
+        img.filepath_raw = out
+        img.file_format = "PNG"
+        img.save()
+        sw, sh = img.size
+    finally:
+        bpy.data.images.remove(img)
+
+    with open(out, "rb") as f:
+        data = base64.standard_b64encode(f.read()).decode("ascii")
+    text = f"{caption} ({w}x{h}"
+    text += f", shown at {sw}x{sh})." if (sw, sh) != (w, h) else ")."
+    if black:
+        text += " Note: the image is almost entirely black."
+    return [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+        {"type": "text", "text": text},
+    ]
+
+
 def capture_viewport(args):
-    path = os.path.join(tempfile.gettempdir(), f"claude_viewport_{os.getpid()}.png")
+    path = _temp_png("viewport")
     ov = view3d_override()
     if "area" not in ov:
         raise RuntimeError("No 3D Viewport is open to capture.")
-    captured = False
+    _remove_file(path)  # never return a stale capture from an earlier call
+    note = ""
     err = None
     try:
         with bpy.context.temp_override(**ov):
             bpy.ops.screen.screenshot_area(filepath=path)
-        captured = os.path.exists(path)
+        if os.path.exists(path):
+            if not _is_black_file(path):
+                return _png_blocks(path, path, "Screenshot of the 3D Viewport")
+            # Screenshots read the window's on-screen image, which can be black when
+            # Blender is minimized or covered. An offscreen draw doesn't depend on that.
+            note = (
+                "The screenshot came back black (Blender's window may be minimized or "
+                "covered), so this is an offscreen render of the viewport instead, without "
+                "overlays."
+            )
+            _remove_file(path)
     except Exception as e:
         err = e
-    if not captured:
-        # Fallback: OpenGL render of the viewport (no UI chrome).
-        try:
-            with bpy.context.temp_override(**ov):
-                bpy.ops.render.opengl(view_context=True)
-            bpy.data.images["Render Result"].save_render(path)
-            captured = True
-        except Exception as e2:
-            raise RuntimeError(f"Could not capture viewport: {err or ''} / {e2}")
-
-    img = bpy.data.images.load(path, check_existing=False)
+    # Fallback: OpenGL render of the viewport (no UI chrome).
     try:
-        w, h = img.size
-        longest = max(w, h)
-        if longest > MAX_IMAGE_EDGE:
-            s = MAX_IMAGE_EDGE / longest
-            img.scale(max(1, int(w * s)), max(1, int(h * s)))
-            img.filepath_raw = path
-            img.file_format = "PNG"
-            img.save()
-        w, h = img.size
-    finally:
-        bpy.data.images.remove(img)
+        with bpy.context.temp_override(**ov):
+            bpy.ops.render.opengl(view_context=True)
+        bpy.data.images["Render Result"].save_render(path)
+    except Exception as e2:
+        first = err or ("the screenshot was black" if note else "no screenshot was written")
+        raise RuntimeError(f"Could not capture viewport: {first} / {e2}")
+    caption = "Offscreen render of the 3D Viewport" if note else "Viewport render"
+    blocks = _png_blocks(path, path, caption)
+    if note:
+        blocks[-1]["text"] = note + " " + blocks[-1]["text"]
+    return blocks
 
-    with open(path, "rb") as f:
-        data = base64.standard_b64encode(f.read()).decode("ascii")
-    return [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
-        {"type": "text", "text": f"Screenshot of the 3D Viewport ({w}x{h})."},
-    ]
+
+def view_image(args):
+    out = _temp_png("image")
+    _remove_file(out)
+    path = args.get("path")
+    if path:
+        path = os.path.abspath(bpy.path.abspath(path))
+        if not os.path.isfile(path):
+            raise RuntimeError(f"No file at {path}.")
+        return _png_blocks(path, out, f"Image file {path}")
+
+    name = args.get("image") or "Render Result"
+    img = bpy.data.images.get(name)
+    if img is None:
+        if args.get("image"):
+            names = ", ".join(sorted(i.name for i in bpy.data.images)[:30]) or "none"
+            raise RuntimeError(f"No image named {name!r}. Images in the file: {names}.")
+        raise RuntimeError("There is no render yet. Render first, or pass path or image.")
+
+    src = _temp_png("image_src")
+    _remove_file(src)
+    if img.type in {"RENDER_RESULT", "COMPOSITING"}:
+        # Render Result has no readable pixels; save_render writes it with the scene's
+        # colour management, as the user would see it.
+        try:
+            img.save_render(src)
+        except Exception as e:
+            raise RuntimeError(f"Could not read {name!r} (has anything been rendered?): {e}")
+        return _png_blocks(src, out, f"Image {name!r}")
+
+    # Ordinary image (e.g. a baked texture, possibly packed or never saved): copy its
+    # pixels into a temporary image so the original is left untouched.
+    w, h = img.size
+    if not w or not h or not img.has_data:
+        raise RuntimeError(f"Image {name!r} has no pixel data.")
+    px = [0.0] * (w * h * img.channels)
+    img.pixels.foreach_get(px)
+    tmp = bpy.data.images.new("claude_view_tmp", w, h, alpha=img.channels == 4,
+                              float_buffer=img.is_float)
+    try:
+        tmp.colorspace_settings.name = img.colorspace_settings.name
+        if img.channels == 4:
+            tmp.pixels.foreach_set(px)
+        else:  # expand to RGBA
+            import numpy as np
+            a = np.array(px, dtype=np.float32).reshape(-1, img.channels)
+            rgba = np.ones((w * h, 4), dtype=np.float32)
+            rgba[:, :3] = a[:, :1] if img.channels == 1 else a[:, :3]
+            tmp.pixels.foreach_set(rgba.ravel())
+        tmp.filepath_raw = src
+        tmp.file_format = "PNG"
+        tmp.save()
+    finally:
+        bpy.data.images.remove(tmp)
+    return _png_blocks(src, out, f"Image {name!r}")
+
+
+def _world_points(ev):
+    """World-space points of an evaluated object: its vertices, or for objects without
+    geometry (empties) the origin and three axis tips."""
+    mw = ev.matrix_world
+    me = None
+    with contextlib.suppress(RuntimeError):
+        me = ev.to_mesh()
+    if me is not None:
+        pts = [mw @ v.co for v in me.vertices]
+        ev.to_mesh_clear()
+        if pts:
+            return pts
+    from mathutils import Vector
+
+    s = getattr(ev, "empty_display_size", 1.0) or 1.0
+    return [mw @ Vector(p) for p in ((0, 0, 0), (s, 0, 0), (0, s, 0), (0, 0, s))]
+
+
+def _len(d):
+    if d < 0.01:
+        return f"{d * 1000:.2f} mm"
+    return f"{d * 100:.1f} cm" if d < 1 else f"{d:.3f} m"
+
+
+def check_animation_loop(args):
+    from mathutils import Vector
+    from mathutils.kdtree import KDTree
+
+    scene = bpy.context.scene
+    start, end = int(args["start"]), int(args["end"])
+    mid = (start + end) // 2
+    track = args.get("nla_track")
+    names = args.get("objects")
+    if names:
+        missing = [n for n in names if n not in bpy.data.objects]
+        if missing:
+            raise RuntimeError(f"No object named: {', '.join(missing)}.")
+        objs = [bpy.data.objects[n] for n in names]
+    else:
+        objs = [o for o in bpy.context.view_layer.objects if o.type == "MESH" and o.visible_get()]
+    if not objs:
+        raise RuntimeError("No visible mesh objects to check.")
+
+    notes = []
+    saved_mutes = []
+    if track:
+        found = False
+        for o in bpy.data.objects:
+            ad = o.animation_data
+            if not ad or not len(ad.nla_tracks):
+                continue
+            for t in ad.nla_tracks:
+                saved_mutes.append((t, t.mute))
+                t.mute = t.name != track
+                found = found or t.name == track
+            if ad.action:
+                notes.append(f"{o.name} also has an active action ({ad.action.name}), "
+                             "which plays on top of its NLA tracks.")
+        if not found:
+            for t, m in saved_mutes:
+                t.mute = m
+            raise RuntimeError(f"No NLA track named {track!r} on any object.")
+
+    frames = sorted({start, start + 1, start + 2, start + 3, mid, end - 3, end - 2, end - 1, end})
+    mats = {o.name: {} for o in objs}
+    pts = {}
+    orig = (scene.frame_current, scene.frame_subframe)
+    try:
+        for f in frames:
+            scene.frame_set(f)
+            dg = bpy.context.evaluated_depsgraph_get()
+            for o in objs:
+                ev = o.evaluated_get(dg)
+                mats[o.name][f] = ev.matrix_world.copy()
+                if f in (start, mid, end):
+                    pts[(o.name, f)] = _world_points(ev)
+    finally:
+        for t, m in saved_mutes:
+            t.mute = m
+        scene.frame_set(orig[0], subframe=orig[1])
+
+    head = f"Loop check, frame {end} against frame {start}"
+    head += f" (only NLA tracks named {track!r} playing):" if track else ":"
+    lines, ok, static = [head], [], []
+    for o in objs:
+        n = o.name
+        p0, p1, pm = pts[(n, start)], pts[(n, end)], pts[(n, mid)]
+        lo = Vector((min(p.x for p in p0), min(p.y for p in p0), min(p.z for p in p0)))
+        hi = Vector((max(p.x for p in p0), max(p.y for p in p0), max(p.z for p in p0)))
+        diag = (hi - lo).length
+        tol = max(1e-5, diag * 0.002)
+        tiny = max(1e-7, diag * 1e-4)
+        M = mats[n]
+        moved = any(abs(x) > 1e-7 for f in frames for ra, rb in zip(M[f], M[start]) for x in ra - rb)
+        if not moved and len(pm) == len(p0):
+            moved = any((a - b).length > tiny for a, b in zip(pm, p0))
+        if not moved and len(p1) == len(p0):
+            moved = any((a - b).length > tiny for a, b in zip(p1, p0))
+        if not moved:
+            static.append(n)
+            continue
+
+        problems = []
+        # Pose: every end-frame point should sit on a start-frame point.
+        kd = KDTree(len(p0))
+        for i, p in enumerate(p0):
+            kd.insert(p, i)
+        kd.balance()
+        dists = [(kd.find(p)[2], p) for p in p1]
+        worst, wp = max(dists, key=lambda x: x[0])
+        median = sorted(d for d, _ in dists)[len(dists) // 2]
+        if len(p1) != len(p0):
+            problems.append(f"vertex count changes ({len(p0)} -> {len(p1)})")
+        if worst > tol:
+            problems.append(
+                f"POSE MISMATCH: frame {end} is off frame {start} by up to {_len(worst)} "
+                f"(median {_len(median)}; bounding-box diagonal {_len(diag)}), worst near "
+                f"({wp.x:.2f}, {wp.y:.2f}, {wp.z:.2f}). A rotating part that is off its pivot "
+                "drifts and snaps back; a part whose symmetry doesn't match the turn (three "
+                "claws on a disc turning 1/7, say) jumps.")
+
+        # Motion across the seam, from world-space transform deltas applied to the
+        # object's extent (so a symmetric spin compares equal at both ends).
+        corners = [Vector((x, y, z)) for x in (lo.x, hi.x) for y in (lo.y, hi.y) for z in (lo.z, hi.z)]
+
+        def disp(a, b):
+            D = M[b] @ M[a].inverted_safe()
+            return [D @ c - c for c in corners]
+
+        def mag(ds):
+            return max(d.length for d in ds)
+
+        ds, de = disp(start, start + 1), disp(end - 1, end)
+        acc_s = max((a - b).length for a, b in zip(disp(start + 1, start + 2), ds))
+        acc_e = max((a - b).length for a, b in zip(de, disp(end - 2, end - 1)))
+        near = (mag(disp(start + 2, start + 3)) + mag(disp(end - 3, end - 2))) / 2
+        seam = (mag(ds) + mag(de)) / 2
+        jump = max((a - b).length for a, b in zip(ds, de))
+        den = math.sqrt(sum(a.length_squared for a in ds) * sum(b.length_squared for b in de))
+        cos = sum(a.dot(b) for a, b in zip(ds, de)) / den if den > 1e-14 else 1.0
+        if jump > tiny and jump > 3 * max(acc_s, acc_e):
+            problems.append(
+                f"JUMP: the motion changes abruptly at the seam (moves {_len(mag(de))}/frame "
+                f"into frame {end}, {_len(mag(ds))}/frame out of frame {start}, in different "
+                "directions).")
+        elif near > tiny and cos > 0.3 and seam < 0.4 * near:
+            problems.append(
+                f"STALL: it slows to {_len(seam)}/frame at the seam against {_len(near)}/frame "
+                "two frames either side, moving the same way, so it pauses at every loop. "
+                "Usually flat handles on the end keys: give the F-curves a Cycles modifier so "
+                "the handles wrap around the loop.")
+        if problems:
+            lines.append(f"- {n}: " + " ".join(problems))
+        else:
+            ok.append(n)
+    if ok:
+        lines.append("- Seamless: " + ", ".join(ok))
+    if static:
+        lines.append(f"- Not moving in this range: {', '.join(static[:20])}"
+                     + (f" and {len(static) - 20} more" if len(static) > 20 else ""))
+    lines += [f"Note: {x}" for x in notes]
+    return "\n".join(lines)
 
 
 HANDLERS = {
@@ -506,6 +863,8 @@ HANDLERS = {
     "get_object_details": get_object_details,
     "execute_python": execute_python,
     "capture_viewport": capture_viewport,
+    "view_image": view_image,
+    "check_animation_loop": check_animation_loop,
 }
 
 
