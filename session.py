@@ -43,6 +43,9 @@ and fix it rather than repeating the same call.
 - Keep changes focused on what was asked. Don't delete, rename or overwrite existing work \
 unless the user asked for it; if a request is ambiguous and would destroy work, ask first.
 - Name new objects and materials meaningfully, and put larger builds in their own collection.
+- Renders and bakes freeze Blender while they run. Use EEVEE for preview renders unless \
+the task asks for Cycles; when Cycles is needed (such as for baking), use the GPU if one is \
+available and keep samples modest.
 - To use another .blend while working in the open one, append or link from it \
 (bpy.data.libraries.load) rather than opening it, which would replace the user's scene.
 

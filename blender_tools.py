@@ -718,6 +718,74 @@ def _len(d):
     return f"{d * 100:.1f} cm" if d < 1 else f"{d:.3f} m"
 
 
+def _action_fcurves(action, slot):
+    layers = getattr(action, "layers", None)
+    if layers is None:  # Blender before 4.4
+        return list(action.fcurves)
+    out = []
+    for layer in layers:
+        for st in layer.strips:
+            if slot is not None:
+                cb = st.channelbag(slot)
+                if cb:
+                    out += list(cb.fcurves)
+            else:
+                for cb in st.channelbags:
+                    out += list(cb.fcurves)
+    return out
+
+
+def _playing_fcurves(o):
+    """(fcurve, scene frame -> action frame) for every F-curve currently driving o."""
+    ad = o.animation_data
+    if not ad:
+        return []
+    out = []
+    if ad.action:
+        out += [(fc, lambda f: f) for fc in _action_fcurves(ad.action, getattr(ad, "action_slot", None))]
+    if ad.use_nla:
+        tracks = list(ad.nla_tracks)
+        if any(t.is_solo for t in tracks):
+            tracks = [t for t in tracks if t.is_solo]
+        for t in tracks:
+            if t.mute:
+                continue
+            for s in t.strips:
+                if s.mute or not s.action:
+                    continue
+
+                def amap(f, s=s):
+                    f = min(max(f, s.frame_start), s.frame_end)
+                    return s.action_frame_start + (f - s.frame_start) / (s.scale or 1.0)
+                out += [(fc, amap) for fc in _action_fcurves(s.action, getattr(s, "action_slot", None))]
+    return out
+
+
+def _stalled_channels(o, start, end):
+    """Channels of o that keep moving the same way through the loop point but slow almost
+    to a stop there (typically flat auto handles on the end keys). A channel that turns
+    around at the loop point is a normal extreme, not a stall."""
+    found = []
+    for fc, amap in _playing_fcurves(o):
+        v = {f: fc.evaluate(amap(f)) for f in (start, start + 1, start + 2, start + 3,
+                                                end - 3, end - 2, end - 1, end)}
+        seam = (abs(v[start + 1] - v[start]) + abs(v[end] - v[end - 1])) / 2
+        near = (abs(v[start + 3] - v[start + 2]) + abs(v[end - 2] - v[end - 3])) / 2
+        through = (v[end] - v[end - 2]) * (v[start + 2] - v[start]) > 0
+        if through and near > 1e-6 and seam < 0.4 * near:
+            found.append(f"{fc.data_path}[{fc.array_index}]")
+    return found
+
+
+def _with_ancestors(objs):
+    seen = []
+    for o in objs:
+        while o is not None and o not in seen:
+            seen.append(o)
+            o = o.parent
+    return seen
+
+
 def check_animation_loop(args):
     from mathutils import Vector
     from mathutils.kdtree import KDTree
@@ -733,10 +801,12 @@ def check_animation_loop(args):
             raise RuntimeError(f"No object named: {', '.join(missing)}.")
         objs = [bpy.data.objects[n] for n in names]
     else:
-        objs = [o for o in bpy.context.view_layer.objects if o.type == "MESH" and o.visible_get()]
+        objs = [o for o in bpy.context.view_layer.objects
+                if o is not None and o.type == "MESH" and o.visible_get()]
     if not objs:
         raise RuntimeError("No visible mesh objects to check.")
 
+    drivers = _with_ancestors(objs)  # the objects and everything that moves them
     notes = []
     saved_mutes = []
     if track:
@@ -749,7 +819,7 @@ def check_animation_loop(args):
                 saved_mutes.append((t, t.mute))
                 t.mute = t.name != track
                 found = found or t.name == track
-            if ad.action:
+            if ad.action and o in drivers:
                 notes.append(f"{o.name} also has an active action ({ad.action.name}), "
                              "which plays on top of its NLA tracks.")
         if not found:
@@ -760,8 +830,13 @@ def check_animation_loop(args):
     frames = sorted({start, start + 1, start + 2, start + 3, mid, end - 3, end - 2, end - 1, end})
     mats = {o.name: {} for o in objs}
     pts = {}
+    stalls = {}
     orig = (scene.frame_current, scene.frame_subframe)
     try:
+        for o in drivers:  # while only the requested tracks are playing
+            ch = _stalled_channels(o, start, end)
+            if ch:
+                stalls[o.name] = ch
         for f in frames:
             scene.frame_set(f)
             dg = bpy.context.evaluated_depsgraph_get()
@@ -829,22 +904,23 @@ def check_animation_loop(args):
         ds, de = disp(start, start + 1), disp(end - 1, end)
         acc_s = max((a - b).length for a, b in zip(disp(start + 1, start + 2), ds))
         acc_e = max((a - b).length for a, b in zip(de, disp(end - 2, end - 1)))
-        near = (mag(disp(start + 2, start + 3)) + mag(disp(end - 3, end - 2))) / 2
-        seam = (mag(ds) + mag(de)) / 2
         jump = max((a - b).length for a, b in zip(ds, de))
-        den = math.sqrt(sum(a.length_squared for a in ds) * sum(b.length_squared for b in de))
-        cos = sum(a.dot(b) for a, b in zip(ds, de)) / den if den > 1e-14 else 1.0
         if jump > tiny and jump > 3 * max(acc_s, acc_e):
             problems.append(
                 f"JUMP: the motion changes abruptly at the seam (moves {_len(mag(de))}/frame "
                 f"into frame {end}, {_len(mag(ds))}/frame out of frame {start}, in different "
                 "directions).")
-        elif near > tiny and cos > 0.3 and seam < 0.4 * near:
+
+        # Stalls are judged per F-curve on the object and its parents: a channel that
+        # keeps going the same way through the loop point but nearly stops there.
+        src = [(a.name, stalls[a.name]) for a in _with_ancestors([o]) if a.name in stalls]
+        if src:
+            which = "; ".join(f"{a} {', '.join(ch)}" for a, ch in src)
             problems.append(
-                f"STALL: it slows to {_len(seam)}/frame at the seam against {_len(near)}/frame "
-                "two frames either side, moving the same way, so it pauses at every loop. "
-                "Usually flat handles on the end keys: give the F-curves a Cycles modifier so "
-                "the handles wrap around the loop.")
+                f"STALL: moved by channels that slow almost to a stop at the loop point while "
+                f"still moving the same way ({which}), so it pauses at every loop. Usually "
+                "flat handles on the end keys: give those F-curves a Cycles modifier so the "
+                "handles wrap around the loop.")
         if problems:
             lines.append(f"- {n}: " + " ".join(problems))
         else:
