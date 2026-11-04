@@ -153,6 +153,7 @@ per token.
 | "Claude Code isn't installed" | Run the [installer](#windows-one-command) again (it offers to install Claude Code), or install it [by hand](#macos-linux-or-by-hand); then restart Blender. If it's installed somewhere unusual, set **Claude Code path** in preferences. |
 | "Claude Code isn't logged in" | Open a terminal, run `claude`, sign in, and try again. |
 | Claude's code fails | Claude usually reads the error and fixes it. If not, click **Copy chat** and share it. |
+| "crender: the glTF exporter changed the transforms of …" in the console | Expected. Blender's glTF exporter can shift unkeyed transform channels of animated child objects on every export (seen in 5.2); while crender is enabled it puts them back after each export, including your own. |
 | Something else | [Open an issue](https://github.com/nickcapron/blender-claude-chat/issues) and paste a **Copy chat** export. |
 
 ## How it works

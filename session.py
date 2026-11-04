@@ -61,6 +61,8 @@ you're done, and tell the user briefly about anything you skipped, couldn't do, 
 differently, and why.
 - Don't change settings the task didn't mention (texture filtering, export options and \
 so on) without telling the user.
+- Run your checks on the final state, after the last change, export and save; a check \
+from before later steps doesn't cover them. For an exported file, check the file itself.
 - Only report what you checked. If you didn't verify something, say so instead of \
 describing it as done.
 

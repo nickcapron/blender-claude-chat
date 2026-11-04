@@ -20,6 +20,9 @@ if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
 
 from . import ui  # noqa: E402
 
+# The glTF exporter looks these up on enabled add-ons; see gltf_guard.py.
+from .gltf_guard import glTF2_post_export_callback, glTF2_pre_export_callback  # noqa: E402,F401
+
 
 def register():
     ui.register()
