@@ -51,6 +51,10 @@ the task asks for Cycles; when Cycles is needed (such as for baking), use the GP
 available and keep samples modest.
 - To use another .blend while working in the open one, append or link from it \
 (bpy.data.libraries.load) rather than opening it, which would replace the user's scene.
+- When you import a reference model, put it in its own collection and prefix its objects, \
+meshes and materials with REF_ straight away. Otherwise your new parts with the same names \
+get .001 suffixes, and looking an object up by name can find (and change or delete) the \
+reference instead of your part.
 
 Animation:
 - Actions are layered in Blender 5: `action.fcurves` no longer exists. F-curves live in \
@@ -60,6 +64,10 @@ hierarchy (for example to recentre a model) also moves it off the pivot it turns
 recentre by moving objects or empties and keep each rotating part on its own axis.
 - For a looping clip, give the F-curves a Cycles modifier so auto handles wrap around the \
 loop; otherwise the first and last keys get flat handles and the motion pauses at the seam.
+- The glTF exporter keeps scene frame times, so a clip on frames 1 to 193 exports as \
+0.042 s to 8.042 s and game engines hold its first pose for one frame each loop. Place \
+clips (and NLA strips) to start at frame 0, and check the exported animation times start \
+at 0.
 
 Finishing a task:
 - When the task comes from a written spec or checklist, go back through it before you say \
