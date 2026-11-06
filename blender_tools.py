@@ -190,6 +190,80 @@ TOOL_DEFS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "measure_model",
+        "description": (
+            "Measure a model: height, width, depth, bounding-box centre, lowest point against "
+            "the ground, and the highest point with the part that reaches it (it says when a "
+            "thin piece such as an antenna sets the height). With path, measures an exported "
+            ".glb/.gltf instead: all meshes and primitives together at the rest pose (skins "
+            "applied), in Blender's axes, plus the triangle count, animation names and time "
+            "ranges, texture sizes and vertex colours. Use it for final numbers rather than "
+            "reading the file by hand."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Exported .glb or .gltf file to measure."},
+                "root": {
+                    "type": "string",
+                    "description": "Measure the meshes in this object's hierarchy.",
+                },
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Mesh objects to measure (default: all visible meshes).",
+                },
+                "frame": {"type": "integer", "description": "Frame to measure at (default: current)."},
+                "height": {
+                    "type": "number",
+                    "description": "Target height from the spec, to report how far off the model is.",
+                },
+                "ground": {"type": "number", "description": "Ground height (default 0)."},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "check_ground_contact",
+        "description": (
+            "Check how an animation meets the ground, frame by frame in the evaluated scene: "
+            "the lowest point at each frame, frames where the model sinks below the ground or "
+            "nothing touches it, and how fast points on the ground move while they touch it "
+            "(foot sliding, or the walking speed of a cycle made in place). Use it on walks, "
+            "runs and anything that stands. Restores the frame and NLA mute states afterwards."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "integer", "description": "First frame to check."},
+                "end": {"type": "integer", "description": "Last frame to check."},
+                "root": {
+                    "type": "string",
+                    "description": "Check the meshes in this object's hierarchy.",
+                },
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Mesh objects to check (default: all visible meshes).",
+                },
+                "nla_track": {
+                    "type": "string",
+                    "description": "Play only the NLA tracks with this name during the check (e.g. 'walk').",
+                },
+                "ground": {"type": "number", "description": "Ground height (default 0)."},
+                "tolerance": {
+                    "type": "number",
+                    "description": "Distance still counted as touching the ground (default 0.5% of the model's height, at least 5 mm).",
+                },
+            },
+            "required": ["start", "end"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -249,6 +323,45 @@ def validate(name, args):
         tol = args.get("tolerance")
         if tol is not None and (not isinstance(tol, (int, float)) or isinstance(tol, bool) or tol < 0):
             return "tolerance must be a non-negative number."
+    elif name in ("measure_model", "check_ground_contact"):
+        if args.get("root") is not None and args.get("objects") is not None:
+            return "Pass either root or objects, not both."
+        r = args.get("root")
+        if r is not None and (not isinstance(r, str) or not r):
+            return "root must be a non-empty string."
+        objs = args.get("objects")
+        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
+            return "objects must be a list of object names."
+        nums = ("height", "ground") if name == "measure_model" else ("ground", "tolerance")
+        for key in nums:
+            v = args.get(key)
+            if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool)):
+                return f"{key} must be a number."
+        if name == "measure_model":
+            p = args.get("path")
+            if p is not None:
+                if not isinstance(p, str) or not p:
+                    return "path must be a non-empty string."
+                if r is not None or objs is not None:
+                    return "Pass either path or root/objects, not both."
+            fr = args.get("frame")
+            if fr is not None and (not isinstance(fr, int) or isinstance(fr, bool)):
+                return "frame must be an integer."
+            h = args.get("height")
+            if h is not None and h <= 0:
+                return "height must be positive."
+        else:
+            s, e = args.get("start"), args.get("end")
+            if not isinstance(s, int) or not isinstance(e, int) or isinstance(s, bool) or isinstance(e, bool):
+                return "start and end must be integers."
+            if not 1 <= e - s <= 500:
+                return "end must be 1 to 500 frames after start."
+            tr = args.get("nla_track")
+            if tr is not None and (not isinstance(tr, str) or not tr):
+                return "nla_track must be a non-empty string."
+            tol = args.get("tolerance")
+            if tol is not None and tol < 0:
+                return "tolerance must be a non-negative number."
     else:
         return f"Unknown tool: {name}"
     return None
@@ -928,8 +1041,11 @@ def check_animation_loop(args):
                 t.mute = m
             raise RuntimeError(f"No NLA track named {track!r} on any object.")
 
-    frames = sorted({start, start + 1, start + 2, start + 3, mid, end - 3, end - 2, end - 1, end})
+    frames = sorted({start, start + 1, start + 2, start + 3, mid, end - 3, end - 2, end - 1, end}
+                    | {start + (end - start) * k // 8 for k in range(1, 8)})
     mats = {o.name: {} for o in objs}
+    scales = {o.name: {} for o in objs}  # the object's own animated scale
+    centres = {}  # middle of the object's geometry, in its local space
     pts = {}
     stalls = {}
     orig = (scene.frame_current, scene.frame_subframe)
@@ -944,6 +1060,9 @@ def check_animation_loop(args):
             for o in objs:
                 ev = o.evaluated_get(dg)
                 mats[o.name][f] = ev.matrix_world.copy()
+                scales[o.name][f] = ev.matrix_basis.to_scale()
+                if f == start:
+                    centres[o.name] = sum((Vector(c) for c in ev.bound_box), Vector()) / 8
                 if f in (start, mid, end):
                     pts[(o.name, f)] = _world_points(ev)
     finally:
@@ -1022,6 +1141,24 @@ def check_animation_loop(args):
                 f"still moving the same way ({which}), so it pauses at every loop. Usually "
                 "flat handles on the end keys: give those F-curves a Cycles modifier so the "
                 "handles wrap around the loop.")
+
+        # Scaling around an origin far from the geometry also slides the geometry.
+        c, s0 = centres[n], scales[n][start]
+        ws = M[start].to_scale()
+        to_world = Vector(tuple(w / s if abs(s) > 1e-9 else 0.0 for w, s in zip(ws, s0)))
+        off = Vector(tuple(a * b * k for a, b, k in zip(c, s0, to_world))).length
+        drift, drift_f = 0.0, start
+        for f in frames:
+            d = Vector(tuple(a * (sf - si) * k for a, sf, si, k in zip(c, scales[n][f], s0, to_world))).length
+            if d > drift:
+                drift, drift_f = d, f
+        if drift > tol:
+            problems.append(
+                f"OFF-PIVOT SCALE: it scales around its origin, which is {_len(off)} from the "
+                f"middle of its geometry, so the scaling also slides it (by {_len(drift)} at "
+                f"frame {drift_f}). A pulsing light or part then bounces back and forth. Set "
+                "its origin to the centre of its geometry, keeping it in place, before "
+                "animating scale.")
         if problems:
             lines.append(f"- {n}: " + " ".join(problems))
         else:
@@ -1261,6 +1398,464 @@ def check_detached_parts(args):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Measuring models and exported files
+# ---------------------------------------------------------------------------
+
+
+def _target_meshes(args):
+    """Visible mesh objects named by args root/objects (or all visible meshes), and how
+    many hidden ones were left out."""
+    root, names = args.get("root"), args.get("objects")
+    if root:
+        if root not in bpy.data.objects:
+            raise RuntimeError(f"No object named {root!r}.")
+        r = bpy.data.objects[root]
+        objs = [o for o in [r, *r.children_recursive] if o.type == "MESH"]
+    elif names:
+        missing = [n for n in names if n not in bpy.data.objects]
+        if missing:
+            raise RuntimeError(f"No object named: {', '.join(missing)}.")
+        objs = [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
+    else:
+        objs = [o for o in bpy.context.view_layer.objects if o is not None and o.type == "MESH"]
+    shown = [o for o in objs if o.visible_get()]
+    if not shown:
+        raise RuntimeError("No visible mesh objects to check.")
+    return shown, len(objs) - len(shown)
+
+
+def _eval_mesh(ev, tris=False):
+    """World-space vertex positions (n x 3 numpy array) of an evaluated object, and its
+    triangle count if asked."""
+    import numpy as np
+
+    me = ev.to_mesh()
+    try:
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        n_tris = 0
+        if tris:
+            me.calc_loop_triangles()
+            n_tris = len(me.loop_triangles)
+    finally:
+        ev.to_mesh_clear()
+    M = np.array(ev.matrix_world, dtype=np.float64)
+    return co.reshape(-1, 3).astype(np.float64) @ M[:3, :3].T + M[:3, 3], n_tris
+
+
+def _ranges(frames):
+    """[0, 1, 2, 5, 9, 10] -> '0-2, 5, 9-10'."""
+    out, run = [], []
+    for f in frames:
+        if run and f == run[-1] + 1:
+            run.append(f)
+        else:
+            if run:
+                out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+            run = [f]
+    if run:
+        out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+    return ", ".join(out)
+
+
+def _describe_extent(P, labels, height, ground):
+    """Report lines for an n x 3 array of world points (Blender axes, Z up, front -Y).
+    labels[i] names the part point i belongs to."""
+    import numpy as np
+
+    lo, hi = P.min(axis=0), P.max(axis=0)
+    size = hi - lo
+    H = float(size[2])
+    top = int(P[:, 2].argmax())
+    lines = [
+        f"Height (Z): {_len(H)}, z {lo[2]:.3f} to {hi[2]:.3f}.",
+        f"Width (X): {_len(float(size[0]))}, x {lo[0]:.3f} to {hi[0]:.3f}. "
+        f"Depth (Y, front is -Y): {_len(float(size[1]))}, y {lo[1]:.3f} to {hi[1]:.3f}.",
+        f"Bounding-box centre: ({(lo[0] + hi[0]) / 2:.3f}, {(lo[1] + hi[1]) / 2:.3f}, "
+        f"{(lo[2] + hi[2]) / 2:.3f}).",
+    ]
+    gap = float(lo[2]) - ground
+    if abs(gap) <= max(1e-4, H * 1e-3):
+        lines.append(f"Lowest point is on the ground (z = {ground:g}).")
+    else:
+        lines.append(f"Lowest point is {_len(abs(gap))} {'above' if gap > 0 else 'below'} "
+                     f"z = {ground:g}.")
+    tp = P[top]
+    lines.append(f"Highest point: {labels[top]} at ({tp[0]:.3f}, {tp[1]:.3f}, {tp[2]:.3f}).")
+    # What sets the height: if only a thin piece reaches the top 5%, say so.
+    band = P[:, 2] >= hi[2] - 0.05 * H
+    bp = P[band]
+    bw = bp[:, :2].max(axis=0) - bp[:, :2].min(axis=0)
+    parts = sorted({labels[i] for i in np.nonzero(band)[0]})
+    lines.append(
+        f"Top 5% of the height (above z {hi[2] - 0.05 * H:.3f}) is reached by "
+        f"{', '.join(parts[:6])}{' ...' if len(parts) > 6 else ''}, spanning "
+        f"{_len(float(bw[0]))} x {_len(float(bw[1]))}"
+        + (" - a thin piece sets the height." if max(bw) < 0.15 * max(size[0], size[1]) else "."))
+    if height:
+        r = H / height
+        lines.append(
+            f"Target height {height:g}: the model is {abs(r - 1) * 100:.1f}% "
+            f"{'taller' if r > 1 else 'shorter'}, so a game that scales it by its bounds to "
+            f"{height:g} draws it at {1 / r:.3f}x.")
+    return lines
+
+
+def _gltf_load(path):
+    """(json, [buffer bytes]) for a .glb or .gltf file."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] == b"glTF":
+        import struct
+
+        pos, js, bins = 12, None, []
+        while pos + 8 <= len(data):
+            clen, ctype = struct.unpack_from("<II", data, pos)
+            chunk = data[pos + 8:pos + 8 + clen]
+            if ctype == 0x4E4F534A:
+                js = json.loads(chunk)
+            elif ctype == 0x004E4942:
+                bins.append(chunk)
+            pos += 8 + clen
+        if js is None:
+            raise RuntimeError("No JSON chunk in the .glb.")
+    else:
+        js, bins = json.loads(data), []
+    bufs = []
+    for i, b in enumerate(js.get("buffers", [])):
+        uri = b.get("uri")
+        if uri is None:
+            bufs.append(bins[0] if bins else b"")
+        elif uri.startswith("data:"):
+            bufs.append(base64.b64decode(uri.split(",", 1)[1]))
+        else:
+            with open(os.path.join(os.path.dirname(path), uri), "rb") as f:
+                bufs.append(f.read())
+    return js, bufs
+
+
+_GL_TYPES = {5120: "i1", 5121: "u1", 5122: "i2", 5123: "u2", 5125: "u4", 5126: "f4"}
+_GL_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
+
+
+def _gltf_accessor(js, bufs, i):
+    """An accessor as a float64 numpy array (count x components), or None if its data
+    isn't plainly readable (compressed, sparse or an unusual layout)."""
+    import numpy as np
+
+    a = js["accessors"][i]
+    if "bufferView" not in a or "sparse" in a or a["type"] not in _GL_COMPONENTS:
+        return None
+    bv = js["bufferViews"][a["bufferView"]]
+    dt = np.dtype("<" + _GL_TYPES[a["componentType"]])
+    nc = _GL_COMPONENTS[a["type"]]
+    stride = bv.get("byteStride") or dt.itemsize * nc
+    off = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
+    arr = np.ndarray((a["count"], nc), dtype=dt, buffer=bufs[bv["buffer"]], offset=off,
+                     strides=(stride, dt.itemsize)).astype(np.float64)
+    if a.get("normalized") and dt.kind in "iu":
+        arr = np.maximum(arr / np.iinfo(dt).max, -1.0)
+    return arr
+
+
+def _gltf_local(n):
+    import numpy as np
+
+    if "matrix" in n:
+        return np.array(n["matrix"], dtype=np.float64).reshape(4, 4).T
+    x, y, z, w = n.get("rotation", (0, 0, 0, 1))
+    R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    M = np.eye(4)
+    M[:3, :3] = R * np.array(n.get("scale", (1, 1, 1)))
+    M[:3, 3] = n.get("translation", (0, 0, 0))
+    return M
+
+
+def _png_size(js, bufs, img):
+    if "bufferView" not in img:
+        return None
+    bv = js["bufferViews"][img["bufferView"]]
+    head = bufs[bv["buffer"]][bv.get("byteOffset", 0):bv.get("byteOffset", 0) + 24]
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    import struct
+
+    return struct.unpack(">II", head[16:24])
+
+
+def _measure_gltf(path, height):
+    import numpy as np
+
+    js, bufs = _gltf_load(path)
+    nodes = js.get("nodes", [])
+    scenes = js.get("scenes") or [{"nodes": list(range(len(nodes)))}]
+    roots = scenes[js.get("scene", 0)].get("nodes", [])
+    world = {}
+
+    def walk(i, parent):
+        world[i] = parent @ _gltf_local(nodes[i])
+        for c in nodes[i].get("children", []):
+            walk(c, world[i])
+
+    for r in roots:
+        walk(r, np.eye(4))
+
+    mats = js.get("materials", [])
+    pts, labels, notes = [], [], []
+    tris = 0
+    prims = 0
+    colour_prims = 0
+    for ni, W in world.items():
+        n = nodes[ni]
+        if "mesh" not in n:
+            continue
+        mesh = js["meshes"][n["mesh"]]
+        mname = mesh.get("name") or n.get("name") or f"mesh {n['mesh']}"
+        skin = js["skins"][n["skin"]] if "skin" in n else None
+        joint_mats = None
+        if skin:
+            ibm = (_gltf_accessor(js, bufs, skin["inverseBindMatrices"])
+                   if "inverseBindMatrices" in skin else None)
+            joint_mats = []
+            for k, j in enumerate(skin["joints"]):
+                B = ibm[k].reshape(4, 4).T if ibm is not None else np.eye(4)
+                joint_mats.append(world.get(j, np.eye(4)) @ B)
+            joint_mats = np.array(joint_mats)
+        for p in mesh.get("primitives", []):
+            prims += 1
+            attrs = p.get("attributes", {})
+            if any(k.startswith("COLOR_") for k in attrs):
+                colour_prims += 1
+            mode = p.get("mode", 4)
+            cnt = (js["accessors"][p["indices"]]["count"] if "indices" in p
+                   else js["accessors"][attrs["POSITION"]]["count"])
+            tris += cnt // 3 if mode == 4 else max(cnt - 2, 0) if mode in (5, 6) else 0
+            label = mname + (f" / {mats[p['material']].get('name', p['material'])}"
+                             if "material" in p and p["material"] < len(mats) else "")
+            pos = _gltf_accessor(js, bufs, attrs["POSITION"])
+            if pos is None:  # compressed: fall back to the accessor's min/max box
+                a = js["accessors"][attrs["POSITION"]]
+                lo, hi = a.get("min"), a.get("max")
+                if not lo or not hi:
+                    notes.append(f"Couldn't read positions of {label}; left out.")
+                    continue
+                pos = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                                for z in (lo[2], hi[2])], dtype=np.float64)
+                notes.append(f"{label} is compressed; its size comes from its bounding box.")
+                skin_here = False
+            else:
+                skin_here = skin is not None and "JOINTS_0" in attrs and "WEIGHTS_0" in attrs
+            ph = np.c_[pos, np.ones(len(pos))]
+            if skin_here:
+                J = _gltf_accessor(js, bufs, attrs["JOINTS_0"]).astype(int)
+                Wt = _gltf_accessor(js, bufs, attrs["WEIGHTS_0"])
+                out = np.zeros_like(ph)
+                for k in range(4):
+                    out += Wt[:, k:k + 1] * np.einsum("nij,nj->ni", joint_mats[J[:, k]], ph)
+                wp = out[:, :3]
+            elif skin is not None:
+                wp = (ph @ joint_mats[0].T)[:, :3]
+            else:
+                wp = (ph @ W.T)[:, :3]
+            # glTF is Y up with the front at +Z; report in Blender's axes.
+            pts.append(np.c_[wp[:, 0], -wp[:, 2], wp[:, 1]])
+            labels += [label] * len(wp)
+    if not pts:
+        raise RuntimeError("No mesh geometry found in the file.")
+    P = np.concatenate(pts)
+
+    lines = [f"{os.path.basename(path)}: {tris:,} triangles in {prims} primitives "
+             f"({len(js.get('meshes', []))} meshes, {len(mats)} materials). Measured at the "
+             "rest pose, in Blender's axes (Z up, front -Y); the file itself stores Y up."]
+    lines += _describe_extent(P, labels, height, 0.0)
+    if js.get("skins"):
+        lines.append("Skins: " + ", ".join(f"{len(s['joints'])} joints" for s in js["skins"]) + ".")
+    anims = js.get("animations", [])
+    if anims:
+        lines.append("Animations:")
+        names = [a.get("name", "(unnamed)") for a in anims]
+        for a, name in zip(anims, names):
+            ins = [js["accessors"][s["input"]] for s in a.get("samplers", [])]
+            t0 = min((x["min"][0] for x in ins if x.get("min")), default=0.0)
+            t1 = max((x["max"][0] for x in ins if x.get("max")), default=0.0)
+            warn = f" - starts at {t0:.3f} s, not 0" if t0 > 1e-4 else ""
+            lines.append(f"- {name!r}: {t0:.3f} to {t1:.3f} s, {len(a.get('channels', []))} "
+                         f"channels{warn}")
+        dup = sorted({x for x in names if names.count(x) > 1})
+        if dup:
+            lines.append(f"Duplicate animation names: {', '.join(dup)}.")
+    else:
+        lines.append("Animations: none.")
+    imgs = js.get("images", [])
+    if imgs:
+        desc = []
+        for im in imgs:
+            sz = _png_size(js, bufs, im)
+            desc.append(f"{im.get('name', '?')} ({sz[0]}x{sz[1]} PNG)" if sz
+                        else f"{im.get('name', '?')} ({im.get('mimeType', im.get('uri', '?'))})")
+        lines.append("Images: " + ", ".join(desc) + ".")
+    if any(s.get("magFilter") == 9728 for s in js.get("samplers", [])):
+        lines.append("A texture sampler uses nearest-pixel filtering (Closest in Blender).")
+    if colour_prims:
+        lines.append(f"Vertex colours (COLOR_0) on {colour_prims} of {prims} primitives; game "
+                     "engines may multiply them into the base colour.")
+    cams = sum(1 for n in nodes if "camera" in n)
+    lights = sum(1 for n in nodes if "KHR_lights_punctual" in n.get("extensions", {}))
+    if cams or lights:
+        lines.append(f"Also contains {cams} cameras and {lights} lights.")
+    lines += [f"Note: {x}" for x in notes[:10]]
+    return "\n".join(lines)
+
+
+def measure_model(args):
+    path, height = args.get("path"), args.get("height")
+    if path:
+        path = bpy.path.abspath(path)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"No file at {path}.")
+        return _measure_gltf(path, height)
+
+    import numpy as np
+
+    objs, hidden = _target_meshes(args)
+    scene = bpy.context.scene
+    orig = (scene.frame_current, scene.frame_subframe)
+    frame = args.get("frame")
+    pts, labels, tris = [], [], 0
+    try:
+        if frame is not None:
+            scene.frame_set(frame)
+        dg = bpy.context.evaluated_depsgraph_get()
+        for o in objs:
+            p, t = _eval_mesh(o.evaluated_get(dg), tris=True)
+            tris += t
+            if len(p):
+                pts.append(p)
+                labels += [o.name] * len(p)
+    finally:
+        scene.frame_set(orig[0], subframe=orig[1])
+    if not pts:
+        raise RuntimeError("The meshes have no vertices.")
+    head = (f"{len(objs)} meshes, {tris:,} triangles (evaluated, modifiers applied), at frame "
+            f"{frame if frame is not None else orig[0]}.")
+    if hidden:
+        head += f" {hidden} hidden meshes left out."
+    return "\n".join([head] + _describe_extent(np.concatenate(pts), labels, height,
+                                                 float(args.get("ground", 0.0))))
+
+
+def _solo_nla(track, drivers):
+    """Mute every NLA track not named track. Returns (saved mute states, notes)."""
+    saved, notes, found = [], [], False
+    for o in bpy.data.objects:
+        ad = o.animation_data
+        if not ad or not len(ad.nla_tracks):
+            continue
+        for t in ad.nla_tracks:
+            saved.append((t, t.mute))
+            t.mute = t.name != track
+            found = found or t.name == track
+        if ad.action and o in drivers:
+            notes.append(f"{o.name} also has an active action ({ad.action.name}), which "
+                         "plays on top of its NLA tracks.")
+    if not found:
+        for t, m in saved:
+            t.mute = m
+        raise RuntimeError(f"No NLA track named {track!r} on any object.")
+    return saved, notes
+
+
+def check_ground_contact(args):
+    import numpy as np
+
+    start, end = int(args["start"]), int(args["end"])
+    ground = float(args.get("ground", 0.0))
+    objs, _ = _target_meshes(args)
+    scene = bpy.context.scene
+    fps = scene.render.fps / (scene.render.fps_base or 1.0)
+    track = args.get("nla_track")
+    saved, notes = _solo_nla(track, _with_ancestors(objs)) if track else ([], [])
+    orig = (scene.frame_current, scene.frame_subframe)
+    frames = list(range(start, end + 1))
+    data = []
+    try:
+        for f in frames:
+            scene.frame_set(f)
+            dg = bpy.context.evaluated_depsgraph_get()
+            data.append(np.concatenate([_eval_mesh(o.evaluated_get(dg))[0] for o in objs]))
+    finally:
+        for t, m in saved:
+            t.mute = m
+        scene.frame_set(orig[0], subframe=orig[1])
+
+    P0 = data[0]
+    H = float(P0[:, 2].max() - P0[:, 2].min())
+    tol = float(args["tolerance"]) if args.get("tolerance") is not None else max(0.005, 0.005 * H)
+    low = np.array([float(p[:, 2].min()) for p in data]) - ground
+
+    head = f"Ground contact, frames {start}-{end}"
+    head += f" (only NLA tracks named {track!r} playing)" if track else ""
+    lines = [head + f", ground z = {ground:g}, touching within {_len(tol)}:"]
+    if len(frames) <= 32:
+        sample = frames
+    else:
+        sample = sorted({frames[round(i * (len(frames) - 1) / 23)] for i in range(24)})
+    lines.append("Lowest point by frame: " + ", ".join(
+        f"{f}: {'+' if low[f - start] >= 0 else '-'}{_len(abs(low[f - start]))}" for f in sample))
+
+    sink = [f for f in frames if low[f - start] < -tol]
+    hover = [f for f in frames if low[f - start] > tol]
+    if sink:
+        k = int(low.argmin())
+        p = data[k][int(data[k][:, 2].argmin())]
+        lines.append(f"- SINKS below the ground at frames {_ranges(sink)}: up to "
+                     f"{_len(-float(low[k]))} at frame {frames[k]}, near ({p[0]:.2f}, {p[1]:.2f}).")
+    if hover:
+        k = int(low.argmax())
+        lines.append(f"- NOTHING TOUCHES the ground at frames {_ranges(hover)}: the lowest point "
+                     f"is up to {_len(float(low[k]))} above it at frame {frames[k]}.")
+    if not sink and not hover:
+        lines.append("- Something touches the ground at every frame, and nothing sinks into it.")
+
+    # How the points touching the ground move: tracked by vertex index between frames.
+    if all(len(p) == len(P0) for p in data):
+        speeds, vecs = [], []
+        for i in range(len(frames) - 1):
+            a, b = data[i], data[i + 1]
+            on = (np.abs(a[:, 2] - ground) <= tol) & (np.abs(b[:, 2] - ground) <= tol)
+            if on.sum() < 3:
+                continue
+            d = b[on, :2] - a[on, :2]
+            v = np.median(d, axis=0) * fps
+            vecs.append(v)
+            speeds.append(float(np.linalg.norm(v)))
+        if speeds:
+            sp = np.array(speeds)
+            mv = np.mean(vecs, axis=0)
+            med = float(np.median(sp))
+            if med < tol * fps * 0.5:
+                lines.append("- Points on the ground stay put while touching it (no sliding).")
+            else:
+                dirn = "backward (+Y)" if mv[1] > abs(mv[0]) else "forward (-Y)" if -mv[1] > abs(mv[0]) else "sideways"
+                lines.append(
+                    f"- Points on the ground move {dirn} at a median {med:.2f} m/s while "
+                    f"touching it (range {sp.min():.2f} to {sp.max():.2f} m/s over "
+                    f"{len(sp)} frame steps). In a cycle made in place this is the walking "
+                    "speed, and it should be steady; for one that moves through the scene, "
+                    "planted points should stay put.")
+                if sp.max() > 2.5 * max(med, 1e-6):
+                    lines.append("- The speed jumps between frames, so feet skate.")
+        else:
+            lines.append("- No points stay on the ground between two frames in a row.")
+    else:
+        lines.append("Note: the vertex count changes between frames, so sliding isn't checked.")
+    lines += [f"Note: {x}" for x in notes]
+    return "\n".join(lines)
+
+
 HANDLERS = {
     "get_scene_summary": get_scene_summary,
     "get_object_details": get_object_details,
@@ -1269,6 +1864,8 @@ HANDLERS = {
     "view_image": view_image,
     "check_animation_loop": check_animation_loop,
     "check_detached_parts": check_detached_parts,
+    "measure_model": measure_model,
+    "check_ground_contact": check_ground_contact,
 }
 
 

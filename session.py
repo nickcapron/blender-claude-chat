@@ -6,6 +6,7 @@ the worker queues a ToolCall and waits; a timer on Blender's main thread runs it
 """
 
 import json
+import os
 import queue
 import threading
 import time
@@ -37,6 +38,12 @@ loop seamless; matching first and last key values doesn't prove it.
 - check_detached_parts finds pieces that float free of a model or are buried inside it. Run \
 it on every model you build before calling it done (pass the model's root), and at a few \
 frames if parts move. A single render hides gaps behind other parts.
+- measure_model gives a model's height, size, centre and ground contact, and names the part \
+that sets its height. With path it measures an exported .glb across all meshes and \
+primitives, with its triangle count and clip names. Use it for every size, height or \
+triangle figure you report; don't compute those by hand.
+- check_ground_contact follows the lowest point frame by frame and finds sinking, hovering \
+and sliding feet. Run it on every walk, run or standing idle.
 
 Working in Blender:
 - Prefer the data API (bpy.data, object and node properties) over bpy.ops where practical. \
@@ -47,8 +54,16 @@ and fix it rather than repeating the same call.
 unless the user asked for it; if a request is ambiguous and would destroy work, ask first.
 - Name new objects and materials meaningfully, and put larger builds in their own collection.
 - Renders and bakes freeze Blender while they run. Use EEVEE for preview renders unless \
-the task asks for Cycles; when Cycles is needed (such as for baking), use the GPU if one is \
-available and keep samples modest.
+the task asks for Cycles; when Cycles is needed (such as for baking), keep samples modest \
+and set scene.cycles.device to 'GPU' if the user has a GPU device enabled in preferences. \
+Don't change preferences (bpy.context.preferences, including the Cycles compute device \
+type and which devices are used): they apply to every file the user opens, not just this one.
+- EEVEE has no bloom setting since Blender 4.2 (scene.eevee.use_bloom is gone); emission \
+strength alone sets how bright glowing parts look.
+- Fix and check geometry while a model is still separate parts, then join, UV-unwrap and \
+bake. Once parts are joined you can't select one by name or by its old bounding box. If you \
+change the mesh after a bake, bake again; otherwise the baked shading and grime no longer \
+match the shape, and stretched faces stretch the texture.
 - To use another .blend while working in the open one, append or link from it \
 (bpy.data.libraries.load) rather than opening it, which would replace the user's scene.
 - When you import a reference model, put it in its own collection and prefix its objects, \
@@ -70,6 +85,14 @@ Animation:
 - Objects rotate and scale around their origin. Moving mesh data inside an animated \
 hierarchy (for example to recentre a model) also moves it off the pivot it turns around, so \
 recentre by moving objects or empties and keep each rotating part on its own axis.
+- Before you animate an object's scale or rotation, put its origin where it should pivot: \
+the middle of its geometry for a pulsing light or a spinning drum, the hinge for a claw or \
+door. A glow whose origin sits at the hull's centre metres away slides back and forth as it \
+pulses instead of swelling in place. Parts that share a mesh's origin by default (all \
+built at one location, then edited in Edit Mode) are the usual cause.
+- For a walk or run, the feet that carry the weight should rest on the ground and not \
+sink into it, with the body lowest just after a foot lands and highest as the legs pass. \
+check_ground_contact shows this.
 - For a looping clip, give the F-curves a Cycles modifier so auto handles wrap around the \
 loop; otherwise the first and last keys get flat handles and the motion pauses at the seam.
 - The glTF exporter keeps scene frame times, so a clip on frames 1 to 193 exports as \
@@ -81,13 +104,16 @@ range, so set the scene start to 0 and its end to at least the last frame of the
 `frame_start` or `frame_end` moves only that end, so the strip stretches or shrinks.
 
 Finishing a task:
-- When the task comes from a written spec or checklist, go back through it before you say \
-you're done, and tell the user briefly about anything you skipped, couldn't do, or did \
-differently, and why.
+- When the task comes from a written spec or checklist, go back through it item by item \
+before you say you're done, including what it describes (shapes such as "curved", what \
+surrounds or holds what, colours), not only the technical numbers. Tell the user briefly \
+about anything you skipped, couldn't do, or did differently, and why.
 - Don't change settings the task didn't mention (texture filtering, export options and \
 so on) without telling the user.
 - Run your checks on the final state, after the last change, export and save; a check \
-from before later steps doesn't cover them. For an exported file, check the file itself.
+from before later steps doesn't cover them. For an exported file, check the file itself \
+with measure_model (path=...). A glTF mesh has one primitive per material, so a bound or \
+count read from one primitive misses the rest.
 - Only report what you checked. If you didn't verify something, say so instead of \
 describing it as done.
 
@@ -457,6 +483,13 @@ class ChatSession:
                 label += f" ({args['nla_track']})"
         elif name == "check_detached_parts" and isinstance(args, dict):
             label = f"check for loose parts{' in ' + repr(args['root']) if args.get('root') else ''}"
+        elif name == "measure_model" and isinstance(args, dict):
+            what = args.get("path") or args.get("root")
+            label = f"measure {os.path.basename(what) if args.get('path') else repr(what)}" if what else "measure model"
+        elif name == "check_ground_contact" and isinstance(args, dict):
+            label = f"check ground contact {args.get('start')}-{args.get('end')}"
+            if args.get("nla_track"):
+                label += f" ({args['nla_track']})"
         tool_entry = self._add("tool", f"-> {label}")
 
         def done(content, is_error):
