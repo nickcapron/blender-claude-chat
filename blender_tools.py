@@ -2110,7 +2110,7 @@ def check_ground_contact(args):
 
     # How the points touching the ground move: tracked by vertex index between frames.
     if all(len(p) == len(P0) for p in data):
-        speeds, vecs = [], []
+        speeds, vecs, step_frames = [], [], []
         for i in range(len(frames) - 1):
             a, b = data[i], data[i + 1]
             on = (np.abs(a[:, 2] - ground) <= tol) & (np.abs(b[:, 2] - ground) <= tol)
@@ -2120,6 +2120,7 @@ def check_ground_contact(args):
             v = np.median(d, axis=0) * fps
             vecs.append(v)
             speeds.append(float(np.linalg.norm(v)))
+            step_frames.append(frames[i])
         if speeds:
             sp = np.array(speeds)
             mv = np.mean(vecs, axis=0)
@@ -2132,10 +2133,20 @@ def check_ground_contact(args):
                     f"- Points on the ground move {dirn} at a median {med:.2f} m/s while "
                     f"touching it (range {sp.min():.2f} to {sp.max():.2f} m/s over "
                     f"{len(sp)} frame steps). In a cycle made in place this is the walking "
-                    "speed, and it should be steady; for one that moves through the scene, "
-                    "planted points should stay put.")
-                if sp.max() > 2.5 * max(med, 1e-6):
-                    lines.append("- The speed jumps between frames, so feet skate.")
+                    f"speed: the game must move the model at about {med:.2f} m/s for the feet "
+                    "to stay put, so tell the user this figure. For a cycle that moves "
+                    "through the scene, planted points should stay put instead.")
+                if sp.max() > 1.5 * med or sp.min() < 0.6 * med:
+                    slow = [f for f, s in zip(step_frames, speeds) if s < 0.6 * med]
+                    fast = [f for f, s in zip(step_frames, speeds) if s > 1.5 * med]
+                    where = "; ".join(x for x in (
+                        f"slow from frames {_ranges(slow)}" if slow else "",
+                        f"fast from frames {_ranges(fast)}" if fast else "") if x)
+                    lines.append(
+                        f"- UNEVEN SPEED ({where}): moved at a steady speed, the feet SLIDE "
+                        "(forward where the planted foot is slow, backward where it is fast). "
+                        "Make the stance-leg swing even, for example with linear "
+                        "interpolation on the thigh keys while the foot is down.")
         else:
             lines.append("- No points stay on the ground between two frames in a row.")
     else:
