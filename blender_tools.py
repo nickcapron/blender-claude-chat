@@ -152,6 +152,43 @@ TOOL_DEFS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "check_detached_parts",
+        "description": (
+            "Find pieces of a model that float free of it or are buried inside it, which one "
+            "rendered view easily hides. Splits the evaluated meshes into connected pieces, "
+            "joins pieces whose surfaces cross or come within a small tolerance, and reports "
+            "every group not joined to the main body with its position, size and gap. Pass "
+            "root (or objects) to check one model when the scene holds several. Check at "
+            "several frames if parts move."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "root": {
+                    "type": "string",
+                    "description": "Check the meshes in this object's hierarchy (it and all its descendants).",
+                },
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Mesh objects to check (default: all visible meshes).",
+                },
+                "frames": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Frames to check at, up to 8 (default: the current frame).",
+                },
+                "tolerance": {
+                    "type": "number",
+                    "description": "Gap still counted as touching, in scene units (default 0.2% of the model's size).",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -195,6 +232,22 @@ def validate(name, args):
         tr = args.get("nla_track")
         if tr is not None and (not isinstance(tr, str) or not tr):
             return "nla_track must be a non-empty string."
+    elif name == "check_detached_parts":
+        if args.get("root") is not None and args.get("objects") is not None:
+            return "Pass either root or objects, not both."
+        r = args.get("root")
+        if r is not None and (not isinstance(r, str) or not r):
+            return "root must be a non-empty string."
+        objs = args.get("objects")
+        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
+            return "objects must be a list of object names."
+        fr = args.get("frames")
+        if fr is not None and (not isinstance(fr, list) or not 1 <= len(fr) <= 8
+                               or not all(isinstance(f, int) and not isinstance(f, bool) for f in fr)):
+            return "frames must be a list of 1 to 8 integers."
+        tol = args.get("tolerance")
+        if tol is not None and (not isinstance(tol, (int, float)) or isinstance(tol, bool) or tol < 0):
+            return "tolerance must be a non-negative number."
     else:
         return f"Unknown tool: {name}"
     return None
@@ -934,6 +987,232 @@ def check_animation_loop(args):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Detached parts
+# ---------------------------------------------------------------------------
+
+
+def _mesh_pieces(obj, depsgraph):
+    """Connected pieces of an evaluated mesh, in world space. Only faces join vertices (a
+    loose edge renders as nothing), and vertices at the same spot count as one, since
+    importers split flat-shaded meshes per face."""
+    from mathutils.bvhtree import BVHTree
+
+    ev = obj.evaluated_get(depsgraph)
+    me = ev.to_mesh()
+    try:
+        mw = ev.matrix_world
+        verts = [mw @ v.co for v in me.vertices]
+        parent = list(range(len(verts)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def join(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        seen = {}
+        for i, p in enumerate(verts):
+            j = seen.setdefault((round(p.x, 5), round(p.y, 5), round(p.z, 5)), i)
+            if j != i:
+                join(j, i)
+        polys = [tuple(p.vertices) for p in me.polygons]
+        for vs in polys:
+            for v in vs[1:]:
+                join(vs[0], v)
+        groups = {}
+        for vs in polys:
+            groups.setdefault(find(vs[0]), []).append(vs)
+        out = []
+        for faces in groups.values():
+            idx = sorted({v for vs in faces for v in vs})
+            remap = {v: n for n, v in enumerate(idx)}
+            pts = [verts[v] for v in idx]
+            local = [[remap[v] for v in vs] for vs in faces]
+            out.append({
+                "obj": obj.name,
+                "verts": pts,
+                "polys": local,
+                "tree": BVHTree.FromPolygons(pts, local),
+                "lo": tuple(min(p[k] for p in pts) for k in range(3)),
+                "hi": tuple(max(p[k] for p in pts) for k in range(3)),
+            })
+        return out
+    finally:
+        ev.to_mesh_clear()
+
+
+def _union_tree(pieces):
+    from mathutils.bvhtree import BVHTree
+
+    verts, polys = [], []
+    for p in pieces:
+        off = len(verts)
+        verts.extend(p["verts"])
+        polys.extend([[off + v for v in vs] for vs in p["polys"]])
+    return BVHTree.FromPolygons(verts, polys)
+
+
+def _min_dist(points, tree, limit):
+    best = limit
+    for p in points:
+        hit = tree.find_nearest(p, best)
+        if hit[0] is not None and hit[3] < best:
+            best = hit[3]
+    return best
+
+
+def _enclosed(point, tree):
+    """True if a ray along each of the six axes leaves the surface from inside."""
+    from mathutils import Vector
+
+    for d in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+        d = Vector(d)
+        hit = tree.ray_cast(point, d)
+        if hit[0] is None or hit[1].dot(d) <= 0:
+            return False
+    return True
+
+
+def _detached_at_frame(objs, tol):
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
+
+    dg = bpy.context.evaluated_depsgraph_get()
+    pcs = [p for o in objs for p in _mesh_pieces(o, dg)]
+    if not pcs:
+        raise RuntimeError("The meshes to check have no faces.")
+    lo = Vector([min(p["lo"][k] for p in pcs) for k in range(3)])
+    hi = Vector([max(p["hi"][k] for p in pcs) for k in range(3)])
+    size = (hi - lo).length
+    if tol is None:
+        tol = max(size * 0.002, 1e-5)
+
+    n = len(pcs)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # Sweep along X so only pieces whose boxes come near each other are compared.
+    order = sorted(range(n), key=lambda i: pcs[i]["lo"][0])
+    for k, a in enumerate(order):
+        A = pcs[a]
+        for b in order[k + 1:]:
+            B = pcs[b]
+            if B["lo"][0] > A["hi"][0] + tol:
+                break
+            if find(a) == find(b):
+                continue
+            if any(A["lo"][j] - tol > B["hi"][j] or B["lo"][j] - tol > A["hi"][j] for j in (1, 2)):
+                continue
+            small, big = (A, B) if len(A["verts"]) <= len(B["verts"]) else (B, A)
+            if (A["tree"].overlap(B["tree"])
+                    or _min_dist(small["verts"], big["tree"], tol) < tol
+                    or _min_dist(big["verts"], small["tree"], tol) < tol):
+                parent[find(b)] = find(a)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    ordered = sorted(groups.values(), key=lambda g: sum(len(pcs[i]["verts"]) for i in g), reverse=True)
+    main = ordered[0]
+    main_tree = _union_tree([pcs[i] for i in main])
+
+    floating, buried = [], []
+    for g in ordered[1:]:
+        pts = [v for i in g for v in pcs[i]["verts"]]
+        glo = Vector([min(p[k] for p in pts) for k in range(3)])
+        ghi = Vector([max(p[k] for p in pts) for k in range(3)])
+        entry = {
+            "objects": sorted({pcs[i]["obj"] for i in g}),
+            "pieces": len(g),
+            "centre": (glo + ghi) / 2,
+            "size": max(ghi - glo),
+            "gap": _min_dist(pts, main_tree, size),
+        }
+        # Buried: sealed inside one main-body piece. Test piece by piece, since shells
+        # nested inside each other confuse a ray test against the whole body.
+        sample = pts[::max(1, len(pts) // 12)]
+        hidden = any(
+            all(pcs[m]["lo"][k] <= glo[k] and ghi[k] <= pcs[m]["hi"][k] for k in range(3))
+            and all(_enclosed(p, pcs[m]["tree"]) for p in sample)
+            for m in main)
+        (buried if hidden else floating).append(entry)
+    floating.sort(key=lambda e: -e["gap"])
+    return {
+        "pieces": n,
+        "tol": tol,
+        "main": sorted({pcs[i]["obj"] for i in main}),
+        "floating": floating,
+        "buried": buried,
+    }
+
+
+def check_detached_parts(args):
+    root, names = args.get("root"), args.get("objects")
+    if root:
+        if root not in bpy.data.objects:
+            raise RuntimeError(f"No object named {root!r}.")
+        r = bpy.data.objects[root]
+        objs = [o for o in [r, *r.children_recursive] if o.type == "MESH"]
+    elif names:
+        missing = [n for n in names if n not in bpy.data.objects]
+        if missing:
+            raise RuntimeError(f"No object named: {', '.join(missing)}.")
+        objs = [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
+    else:
+        objs = [o for o in bpy.context.view_layer.objects
+                if o is not None and o.type == "MESH" and o.visible_get()]
+    if not objs:
+        raise RuntimeError("No mesh objects to check.")
+
+    scene = bpy.context.scene
+    orig = (scene.frame_current, scene.frame_subframe)
+    frames = args.get("frames") or [orig[0]]
+    results = []
+    try:
+        for f in frames:
+            scene.frame_set(f)
+            results.append((f, _detached_at_frame(objs, args.get("tolerance"))))
+    finally:
+        scene.frame_set(orig[0], subframe=orig[1])
+
+    def where(e):
+        c = e["centre"]
+        names = ", ".join(e["objects"][:4]) + (" ..." if len(e["objects"]) > 4 else "")
+        count = f"{e['pieces']} pieces" if e["pieces"] > 1 else "1 piece"
+        return f"{names} ({count}) around ({c.x:.2f}, {c.y:.2f}, {c.z:.2f}), {_len(e['size'])} across"
+
+    lines = []
+    for f, r in results:
+        lines.append(f"Frame {f}: {len(objs)} meshes, {r['pieces']} connected pieces, "
+                     f"touching within {_len(r['tol'])}.")
+        if not r["floating"] and not r["buried"]:
+            lines.append("- Every piece is joined to the main body.")
+            continue
+        main = r["main"]
+        lines.append("- Main body: " + ", ".join(main[:15])
+                     + (f" and {len(main) - 15} more" if len(main) > 15 else ""))
+        for e in r["floating"][:40]:
+            lines.append(f"- FLOATING {where(e)}, {_len(e['gap'])} from the main body")
+        if len(r["floating"]) > 40:
+            lines.append(f"- ... and {len(r['floating']) - 40} more floating groups")
+        for e in r["buried"][:20]:
+            lines.append(f"- BURIED {where(e)}, {_len(e['gap'])} inside the main body, so it never shows")
+        if len(r["buried"]) > 20:
+            lines.append(f"- ... and {len(r['buried']) - 20} more buried groups")
+    return "\n".join(lines)
+
+
 HANDLERS = {
     "get_scene_summary": get_scene_summary,
     "get_object_details": get_object_details,
@@ -941,6 +1220,7 @@ HANDLERS = {
     "capture_viewport": capture_viewport,
     "view_image": view_image,
     "check_animation_loop": check_animation_loop,
+    "check_detached_parts": check_detached_parts,
 }
 
 

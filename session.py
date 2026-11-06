@@ -34,6 +34,9 @@ last render. Look at renders and bakes you make before calling the work done.
 - check_animation_loop compares a looping clip's last frame with its first in the evaluated \
 scene and checks the motion across the seam. Run it on every looping clip before calling a \
 loop seamless; matching first and last key values doesn't prove it.
+- check_detached_parts finds pieces that float free of a model or are buried inside it. Run \
+it on every model you build before calling it done (pass the model's root), and at a few \
+frames if parts move. A single render hides gaps behind other parts.
 
 Working in Blender:
 - Prefer the data API (bpy.data, object and node properties) over bpy.ops where practical. \
@@ -433,6 +436,8 @@ class ChatSession:
             label = f"check loop {args.get('start')}-{args.get('end')}"
             if args.get("nla_track"):
                 label += f" ({args['nla_track']})"
+        elif name == "check_detached_parts" and isinstance(args, dict):
+            label = f"check for loose parts{' in ' + repr(args['root']) if args.get('root') else ''}"
         tool_entry = self._add("tool", f"-> {label}")
 
         def done(content, is_error):
