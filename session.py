@@ -31,17 +31,19 @@ between runs. Use print() or assign to `result` to see values.
 such as layout, materials or lighting, when looking would tell you something the data \
 doesn't.
 - view_image shows you an image file, an image datablock (such as a baked texture) or the \
-last render. Look at renders and bakes you make before calling the work done.
+last render, with its average colour and lightness. Look at renders and bakes you make \
+before calling the work done.
 - check_animation_loop compares a looping clip's last frame with its first in the evaluated \
 scene and checks the motion across the seam. Run it on every looping clip before calling a \
 loop seamless; matching first and last key values doesn't prove it.
 - check_detached_parts finds pieces that float free of a model or are buried inside it. Run \
 it on every model you build before calling it done (pass the model's root), and at a few \
 frames if parts move. A single render hides gaps behind other parts.
-- measure_model gives a model's height, size, centre and ground contact, and names the part \
-that sets its height. With path it measures an exported .glb across all meshes and \
-primitives, with its triangle count and clip names. Use it for every size, height or \
-triangle figure you report; don't compute those by hand.
+- measure_model gives a model's height, size, centre and ground contact, names the parts \
+that set its height and lowest point, and gives the main body's height without thin pieces. \
+With path it measures an exported .glb across all meshes and primitives, with its triangle \
+count and clip names. With reference it compares the model with a reference model. Use it \
+for every size, height or triangle figure you report; don't compute those by hand.
 - check_ground_contact follows the lowest point frame by frame and finds sinking, hovering \
 and sliding feet. Run it on every walk, run or standing idle.
 
@@ -60,6 +62,21 @@ Don't change preferences (bpy.context.preferences, including the Cycles compute 
 type and which devices are used): they apply to every file the user opens, not just this one.
 - EEVEE has no bloom setting since Blender 4.2 (scene.eevee.use_bloom is gone); emission \
 strength alone sets how bright glowing parts look.
+- For preview renders of game assets, use the view transform closest to the game's \
+tonemapper. If the spec doesn't say, keep AgX (Blender's default), which rolls highlights \
+off toward white like the filmic tonemappers most engines use. 'Standard' clips each \
+colour channel on its own, so bright emission changes hue (violet turns pink, teal turns \
+cyan).
+- Object.hide_set() hides an object only in the viewport. Before a render, hide other \
+objects with hide_render or exclude their collection, and aim the camera so the whole \
+model fits inside the frame with a margin (check with \
+bpy_extras.object_utils.world_to_camera_view on the bounding-box corners).
+- Check colour words in a spec ('near-black', a hex colour) in the render, using the \
+average colour view_image reports. If the colour is off, change the material or bake setup \
+and bake again rather than scaling the baked pixels.
+- When a spec says how many pixels wide a game draws the model, render a test at that \
+width from the game's view angle and look at it with view_image: check that the outline and \
+any glowing lines still read. Details under about one pixel wide disappear.
 - Fix and check geometry while a model is still separate parts, then join, UV-unwrap and \
 bake. Once parts are joined you can't select one by name or by its old bounding box. If you \
 change the mesh after a bake, bake again; otherwise the baked shading and grime no longer \
@@ -70,6 +87,25 @@ match the shape, and stretched faces stretch the texture.
 meshes and materials with REF_ straight away. Otherwise your new parts with the same names \
 get .001 suffixes, and looking an object up by name can find (and change or delete) the \
 reference instead of your part.
+- When a spec asks you to match a reference's size or outline, compare your build with it \
+(measure_model with reference=...) on the first blockout and again before export, and fix \
+differences in width, depth, main-body height and squatness rather than only reporting them. \
+If you decide a difference is intended or a measuring artefact, say which and why in your \
+final reply; don't report only the numbers that match. \
+To remove the reference, delete its objects, meshes, materials and actions by name; don't \
+run bpy.ops.outliner.orphans_purge, which also deletes the user's own unused data.
+- To rename data blocks, loop over a list() copy (for m in list(bpy.data.materials)). \
+Renaming re-sorts a bpy.data collection, so looping over it directly visits items again \
+and stacks prefixes until the 63-character limit cuts the names off.
+- Write only the files the task asks for into its output folder. Put test renders and \
+other scratch files in bpy.app.tempdir.
+- bmesh: bmesh.ops.inset_individual and inset_region return the new rim faces in 'faces'; \
+the faces you passed in stay as the inner panels. bmesh.ops.bevel replaces the faces next \
+to the edges it bevels, so face references and indices taken before it no longer point at \
+the same faces, and selecting edges by angle after insets also bevels every inset step. For \
+chamfered edges a Bevel modifier (limit method Angle, or Weight on the edges you mark) is \
+simpler; apply it at export. Check the triangle count with measure_model on the first \
+blockout, not after all the detail is in.
 - Don't call bpy.ops.ed.undo or redo from your code. Undo rolls back whole earlier steps \
 (each of your code runs is one) and leaves your variables pointing at removed data. To back \
 out a change, reverse it explicitly or rebuild the part.
@@ -102,6 +138,13 @@ at 0. With export_frame_range on, the exporter also clips every clip to the scen
 range, so set the scene start to 0 and its end to at least the last frame of the longest clip.
 - To move an NLA strip, set `strip.frame_start_ui`, which moves the whole strip. Setting \
 `frame_start` or `frame_end` moves only that end, so the strip stretches or shrinks.
+- Exporting NLA tracks (export_animation_mode='NLA_TRACKS'): the pose the scene shows when \
+you export becomes the file's rest pose, so leave just one track playing (mute the others) \
+and no active action. Pass export_optimize_animation_size=False and \
+export_optimize_animation_keep_anim_object=True (both are needed) so every clip keys every \
+node any clip animates. Otherwise a channel that stays constant in one clip (a turret held \
+forward in walk) is left out, and the game keeps the value the previous clip left. \
+measure_model with path reports channels some clips key and others don't.
 
 Finishing a task:
 - When the task comes from a written spec or checklist, go back through it item by item \
@@ -116,6 +159,9 @@ with measure_model (path=...). A glTF mesh has one primitive per material, so a 
 count read from one primitive misses the rest.
 - Only report what you checked. If you didn't verify something, say so instead of \
 describing it as done.
+- If you notice something in your result that misses the spec and you can fix it (a \
+detail placed where it can't be seen, a part that lost its bevel, a model taller than the \
+reference), fix it and check again before you finish rather than listing it as a caveat.
 
 Each user message starts with a <blender_context> line describing the current mode, \
 selection and frame at the moment they hit send. "This", "it" or "the selected object" \
