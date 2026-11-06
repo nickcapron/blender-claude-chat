@@ -68,6 +68,8 @@ loop; otherwise the first and last keys get flat handles and the motion pauses a
 0.042 s to 8.042 s and game engines hold its first pose for one frame each loop. Place \
 clips (and NLA strips) to start at frame 0, and check the exported animation times start \
 at 0.
+- To move an NLA strip, set `strip.frame_start_ui`, which moves the whole strip. Setting \
+`frame_start` or `frame_end` moves only that end, so the strip stretches or shrinks.
 
 Finishing a task:
 - When the task comes from a written spec or checklist, go back through it before you say \
