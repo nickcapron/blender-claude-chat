@@ -104,7 +104,10 @@ TOOL_DEFS = [
             "Look at an image by eye: a file on disk (such as a render you saved), an image "
             "datablock by name (such as a texture you baked), or, with neither, the last "
             "render in Blender's Render Result. Use it to check renders and bakes; "
-            "capture_viewport shows the viewport instead."
+            "capture_viewport shows the viewport instead. The result gives the average colour "
+            "and lightness of the subject (a plain background is left out), to check colour "
+            "words such as 'near-black'. Images under 256 px are enlarged with nearest-pixel "
+            "sampling, so a test render at the size a game draws the model can be judged."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -193,13 +196,16 @@ TOOL_DEFS = [
     {
         "name": "measure_model",
         "description": (
-            "Measure a model: height, width, depth, bounding-box centre, lowest point against "
-            "the ground, and the highest point with the part that reaches it (it says when a "
-            "thin piece such as an antenna sets the height). With path, measures an exported "
-            ".glb/.gltf instead: all meshes and primitives together at the rest pose (skins "
-            "applied), in Blender's axes, plus the triangle count, animation names and time "
-            "ranges, texture sizes and vertex colours. Use it for final numbers rather than "
-            "reading the file by hand."
+            "Measure a model: height, width, depth, bounding-box centre, the lowest and highest "
+            "points with the parts that reach them, and the main body's height leaving out thin "
+            "parts (antennas, masts, fangs, rails, welded on or not), saying when such a part "
+            "sets the height or the lowest point. With path, measures an exported .glb/.gltf instead: all meshes "
+            "and primitives together at the rest pose (skins applied), in Blender's axes, plus "
+            "the triangle count, animation names and time ranges, channels some clips key and "
+            "others don't, texture sizes and vertex colours. With reference (an object whose "
+            "hierarchy is measured, hidden or not, or a .glb path), adds a side-by-side "
+            "comparison of width, depth, height, main-body height and squatness. Use it for "
+            "final numbers rather than reading the file by hand."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -216,6 +222,10 @@ TOOL_DEFS = [
                     "description": "Mesh objects to measure (default: all visible meshes).",
                 },
                 "frame": {"type": "integer", "description": "Frame to measure at (default: current)."},
+                "reference": {
+                    "type": "string",
+                    "description": "Reference to compare with: an object name (e.g. 'REF_tank'; its hierarchy, hidden meshes included) or a .glb/.gltf path.",
+                },
                 "height": {
                     "type": "number",
                     "description": "Target height from the spec, to report how far off the model is.",
@@ -350,6 +360,9 @@ def validate(name, args):
             h = args.get("height")
             if h is not None and h <= 0:
                 return "height must be positive."
+            ref = args.get("reference")
+            if ref is not None and (not isinstance(ref, str) or not ref):
+                return "reference must be a non-empty string."
         else:
             s, e = args.get("start"), args.get("end")
             if not isinstance(s, int) or not isinstance(e, int) or isinstance(s, bool) or isinstance(e, bool):
@@ -734,19 +747,82 @@ def _is_black_file(path):
         bpy.data.images.remove(img)
 
 
-def _png_blocks(src, out, caption):
-    """Load the image at src, shrink it to MAX_IMAGE_EDGE, write it to out as PNG and
-    return it as tool-result blocks. src is never modified unless it equals out."""
+def _srgb(lin):
+    import numpy as np
+
+    lin = np.clip(lin, 0.0, 1.0)
+    return np.where(lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1 / 2.4) - 0.055)
+
+
+def _hex(rgb):
+    return "#" + "".join(f"{int(round(float(c) * 255)):02x}" for c in rgb)
+
+
+def _colour_summary(img):
+    """One sentence with the average colour of an image's subject (leaving out a plain
+    background that fills the corners, and transparent pixels) and its lightness."""
+    import numpy as np
+
+    w, h = img.size
+    ch = img.channels
+    if ch < 3:
+        return ""
+    px = np.empty(w * h * ch, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    px = px.reshape(-1, ch)
+    rgb = px[:, :3]
+    if img.is_float:  # float buffers hold linear values; byte ones hold sRGB as stored
+        rgb = _srgb(rgb)
+    corner_idx = [0, w - 1, (h - 1) * w, h * w - 1]
+    mask = px[:, 3] > 0.5 if ch == 4 else np.ones(len(px), dtype=bool)
+    corners = rgb[corner_idx]
+    bg = None
+    if mask[corner_idx].all() and np.ptp(corners, axis=0).max() < 0.03:
+        bg = corners.mean(axis=0)
+        mask &= np.abs(rgb - bg).max(axis=1) > 0.03
+    if mask.sum() < 0.01 * len(px):
+        return ""
+    mean = rgb[mask].mean(axis=0)
+    lin = np.where(mean <= 0.04045, mean / 12.92, ((mean + 0.055) / 1.055) ** 2.4)
+    Y = float(lin @ np.array([0.2126, 0.7152, 0.0722]))
+    L = 116 * (Y ** (1 / 3) if Y > 0.008856 else 7.787 * Y + 16 / 116) - 16
+    where = (f"the subject ({mask.mean() * 100:.0f}% of the image; the background "
+             f"{_hex(bg)} left out)" if bg is not None else "the image")
+    return (f" Average colour of {where}: {_hex(mean)} (sRGB), lightness L* {L:.0f} of 100; "
+            "near-black is roughly below 20.")
+
+
+# Images smaller than this on their longest side are enlarged with nearest-pixel
+# sampling, so a test render at game size (say 48 px) can be seen pixel for pixel.
+SMALL_IMAGE_EDGE = 256
+
+
+def _png_blocks(src, out, caption, stats=False):
+    """Load the image at src, shrink it to MAX_IMAGE_EDGE (or enlarge a small one with
+    nearest-pixel sampling), write it to out as PNG and return it as tool-result blocks.
+    With stats, the caption adds the average colour. src is never modified unless it
+    equals out."""
     img = bpy.data.images.load(src, check_existing=False)
     try:
         w, h = img.size
         if not w or not h:
             raise RuntimeError(f"Could not read image data from {src}.")
         black = _mostly_black(img)
+        summary = _colour_summary(img) if stats else ""
         longest = max(w, h)
         if longest > MAX_IMAGE_EDGE:
             s = MAX_IMAGE_EDGE / longest
             img.scale(max(1, round(w * s)), max(1, round(h * s)))
+        elif longest < SMALL_IMAGE_EDGE:
+            import numpy as np
+
+            f = max(2, (2 * SMALL_IMAGE_EDGE) // longest)
+            ch = img.channels
+            px = np.empty(w * h * ch, dtype=np.float32)
+            img.pixels.foreach_get(px)
+            big = px.reshape(h, w, ch).repeat(f, axis=0).repeat(f, axis=1)
+            img.scale(w * f, h * f)
+            img.pixels.foreach_set(big.ravel())
         img.filepath_raw = out
         img.file_format = "PNG"
         img.save()
@@ -757,9 +833,15 @@ def _png_blocks(src, out, caption):
     with open(out, "rb") as f:
         data = base64.standard_b64encode(f.read()).decode("ascii")
     text = f"{caption} ({w}x{h}"
-    text += f", shown at {sw}x{sh})." if (sw, sh) != (w, h) else ")."
+    if (sw, sh) == (w, h):
+        text += ")."
+    elif sw > w:
+        text += f", enlarged {sw // w}x with nearest-pixel sampling to {sw}x{sh})."
+    else:
+        text += f", shown at {sw}x{sh})."
     if black:
         text += " Note: the image is almost entirely black."
+    text += summary
     return [
         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
         {"type": "text", "text": text},
@@ -860,7 +942,7 @@ def view_image(args):
         path = os.path.abspath(bpy.path.abspath(path))
         if not os.path.isfile(path):
             raise RuntimeError(f"No file at {path}.")
-        return _png_blocks(path, out, f"Image file {path}")
+        return _png_blocks(path, out, f"Image file {path}", stats=True)
 
     name = args.get("image") or "Render Result"
     img = bpy.data.images.get(name)
@@ -879,7 +961,7 @@ def view_image(args):
             img.save_render(src)
         except Exception as e:
             raise RuntimeError(f"Could not read {name!r} (has anything been rendered?): {e}")
-        return _png_blocks(src, out, f"Image {name!r}")
+        return _png_blocks(src, out, f"Image {name!r}", stats=True)
 
     # Ordinary image (e.g. a baked texture, possibly packed or never saved): copy its
     # pixels into a temporary image so the original is left untouched.
@@ -905,7 +987,7 @@ def view_image(args):
         tmp.save()
     finally:
         bpy.data.images.remove(tmp)
-    return _png_blocks(src, out, f"Image {name!r}")
+    return _png_blocks(src, out, f"Image {name!r}", stats=True)
 
 
 def _world_points(ev):
@@ -1403,9 +1485,9 @@ def check_detached_parts(args):
 # ---------------------------------------------------------------------------
 
 
-def _target_meshes(args):
+def _target_meshes(args, include_hidden=False):
     """Visible mesh objects named by args root/objects (or all visible meshes), and how
-    many hidden ones were left out."""
+    many hidden ones were left out. include_hidden keeps hidden ones (for a reference)."""
     root, names = args.get("root"), args.get("objects")
     if root:
         if root not in bpy.data.objects:
@@ -1419,15 +1501,16 @@ def _target_meshes(args):
         objs = [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
     else:
         objs = [o for o in bpy.context.view_layer.objects if o is not None and o.type == "MESH"]
-    shown = [o for o in objs if o.visible_get()]
+    shown = objs if include_hidden else [o for o in objs if o.visible_get()]
     if not shown:
         raise RuntimeError("No visible mesh objects to check.")
     return shown, len(objs) - len(shown)
 
 
-def _eval_mesh(ev, tris=False):
+def _eval_mesh(ev, tris=False, faces=False):
     """World-space vertex positions (n x 3 numpy array) of an evaluated object, and its
-    triangle count if asked."""
+    triangle count if asked. With faces=True also returns its faces as arrays of vertex
+    indices."""
     import numpy as np
 
     me = ev.to_mesh()
@@ -1438,10 +1521,111 @@ def _eval_mesh(ev, tris=False):
         if tris:
             me.calc_loop_triangles()
             n_tris = len(me.loop_triangles)
+        face_list = None
+        if faces:
+            lv = np.empty(len(me.loops), dtype=np.int64)
+            me.loops.foreach_get("vertex_index", lv)
+            ls = np.empty(len(me.polygons), dtype=np.int64)
+            lt = np.empty(len(me.polygons), dtype=np.int64)
+            me.polygons.foreach_get("loop_start", ls)
+            me.polygons.foreach_get("loop_total", lt)
+            face_list = [lv[s:s + t] for s, t in zip(ls, lt)]
     finally:
         ev.to_mesh_clear()
     M = np.array(ev.matrix_world, dtype=np.float64)
-    return co.reshape(-1, 3).astype(np.float64) @ M[:3, :3].T + M[:3, 3], n_tris
+    P = co.reshape(-1, 3).astype(np.float64) @ M[:3, :3].T + M[:3, 3]
+    if faces:
+        return P, n_tris, face_list
+    return P, n_tris
+
+
+# The main body is found slice by slice. The surface is sampled, cut into horizontal
+# slices, and each slice is drawn onto a grid seen from above. A patch of touching cells
+# counts as body if it spans at least this share of the model's longer side; antennas,
+# fangs, rails and masts make small patches and are left out, welded on or not.
+BODY_SPAN_SHARE = 0.15
+_BODY_SLICES = 48
+_BODY_GRID = 50  # cells along the model's longer side
+
+
+def _triangles(faces):
+    """k x 3 vertex-index array from faces (sequences of vertex indices), fan-split."""
+    import numpy as np
+
+    tris = []
+    for f in faces:
+        f = np.asarray(f, dtype=np.int64)
+        if len(f) == 3:
+            tris.append(f[None])
+        elif len(f) > 3:
+            tris.append(np.c_[np.full(len(f) - 2, f[0]), f[1:-1], f[2:]])
+    return np.concatenate(tris) if tris else np.zeros((0, 3), dtype=np.int64)
+
+
+def _extent_stats(P, faces=None):
+    """Bounds of an n x 3 point array, plus the z range of its main body (see
+    BODY_SPAN_SHARE). main_lo/main_hi equal the full range when faces aren't known."""
+    import numpy as np
+
+    lo, hi = P.min(axis=0), P.max(axis=0)
+    st = {"lo": lo, "hi": hi, "main_lo": float(lo[2]), "main_hi": float(hi[2])}
+    size = hi - lo
+    H, side = float(size[2]), float(max(size[0], size[1]))
+    if not faces or H <= 1e-9 or side <= 1e-9:
+        return st
+    T = _triangles(faces)
+    if not len(T):
+        return st
+    A, B, Cc = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(B - A, Cc - A), axis=1)
+    total = float(area.sum())
+    if total <= 0:
+        return st
+    cell = side / _BODY_GRID
+    n = int(min(200000, max(30000, 16 * total / cell ** 2)))
+    rng = np.random.default_rng(0)
+    pick = rng.choice(len(T), size=n, p=area / total)
+    r1, r2 = np.sqrt(rng.random(n)), rng.random(n)
+    S = ((1 - r1)[:, None] * A[pick] + (r1 * (1 - r2))[:, None] * B[pick]
+         + (r1 * r2)[:, None] * Cc[pick])
+    S = np.vstack([S, P])  # the vertices too, so tips and edges are always present
+    gx = np.floor((S[:, 0] - lo[0]) / cell).astype(np.int64).tolist()
+    gy = np.floor((S[:, 1] - lo[1]) / cell).astype(np.int64).tolist()
+    gz = np.minimum(((S[:, 2] - lo[2]) / H * _BODY_SLICES).astype(np.int64), _BODY_SLICES - 1)
+    need = BODY_SPAN_SHARE * _BODY_GRID
+    body = np.zeros(len(S), dtype=bool)
+    order = np.argsort(gz, kind="stable")
+    bounds = np.searchsorted(gz[order], np.arange(_BODY_SLICES + 1))
+    for z in range(_BODY_SLICES):
+        ids = order[bounds[z]:bounds[z + 1]]
+        if not len(ids):
+            continue
+        cells = {(gx[i], gy[i]) for i in ids}
+        flag = {}
+        for c in cells:
+            if c in flag:
+                continue
+            flag[c] = None
+            stack, members = [c], [c]
+            while stack:  # 8-connected patch of occupied cells
+                x, y = stack.pop()
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        nb = (x + dx, y + dy)
+                        if nb in cells and nb not in flag:
+                            flag[nb] = None
+                            stack.append(nb)
+                            members.append(nb)
+            xs = [m[0] for m in members]
+            ys = [m[1] for m in members]
+            big = max(max(xs) - min(xs), max(ys) - min(ys)) + 1 >= need
+            for m in members:
+                flag[m] = big
+        body[ids] = [flag[(gx[i], gy[i])] for i in ids]
+    if body.any():
+        z = S[body, 2]
+        st["main_lo"], st["main_hi"] = float(z.min()), float(z.max())
+    return st
 
 
 def _ranges(frames):
@@ -1459,15 +1643,20 @@ def _ranges(frames):
     return ", ".join(out)
 
 
-def _describe_extent(P, labels, height, ground):
+def _describe_extent(P, labels, height, ground, faces=None, stats=None):
     """Report lines for an n x 3 array of world points (Blender axes, Z up, front -Y).
-    labels[i] names the part point i belongs to."""
+    labels[i] names the part point i belongs to; faces index into P. If stats
+    is a dict, the measurements are stored in it (for comparing with a reference)."""
     import numpy as np
 
-    lo, hi = P.min(axis=0), P.max(axis=0)
+    st = _extent_stats(P, faces)
+    if stats is not None:
+        stats.update(st)
+    lo, hi = st["lo"], st["hi"]
     size = hi - lo
     H = float(size[2])
     top = int(P[:, 2].argmax())
+    low = int(P[:, 2].argmin())
     lines = [
         f"Height (Z): {_len(H)}, z {lo[2]:.3f} to {hi[2]:.3f}.",
         f"Width (X): {_len(float(size[0]))}, x {lo[0]:.3f} to {hi[0]:.3f}. "
@@ -1481,6 +1670,23 @@ def _describe_extent(P, labels, height, ground):
     else:
         lines.append(f"Lowest point is {_len(abs(gap))} {'above' if gap > 0 else 'below'} "
                      f"z = {ground:g}.")
+    lp = P[low]
+    lines.append(f"Lowest point: {labels[low]} at ({lp[0]:.3f}, {lp[1]:.3f}, {lp[2]:.3f}).")
+    tol = max(1e-4, 0.02 * H)
+    below = st["main_lo"] - float(lo[2])
+    above = float(hi[2]) - st["main_hi"]
+    if below > tol or above > tol:
+        lines.append(
+            f"Main body (leaving out thin parts such as antennas, masts, fangs or rails, welded on or not): "
+            f"z {st['main_lo']:.3f} to {st['main_hi']:.3f}, "
+            f"height {_len(st['main_hi'] - st['main_lo'])}.")
+        if below > tol:
+            lines.append(
+                f"Thin parts reach {_len(below)} below the main body, so they set the "
+                "lowest point: a game that puts the lowest point on the ground (or hovers "
+                "the model from it) lifts the main body by that much.")
+        if above > tol:
+            lines.append(f"Thin parts reach {_len(above)} above the main body.")
     tp = P[top]
     lines.append(f"Highest point: {labels[top]} at ({tp[0]:.3f}, {tp[1]:.3f}, {tp[2]:.3f}).")
     # What sets the height: if only a thin piece reaches the top 5%, say so.
@@ -1586,7 +1792,7 @@ def _png_size(js, bufs, img):
     return struct.unpack(">II", head[16:24])
 
 
-def _measure_gltf(path, height):
+def _measure_gltf(path, height, stats=None):
     import numpy as np
 
     js, bufs = _gltf_load(path)
@@ -1605,6 +1811,7 @@ def _measure_gltf(path, height):
 
     mats = js.get("materials", [])
     pts, labels, notes = [], [], []
+    faces, nverts = [], 0
     tris = 0
     prims = 0
     colour_prims = 0
@@ -1648,6 +1855,11 @@ def _measure_gltf(path, height):
                 skin_here = False
             else:
                 skin_here = skin is not None and "JOINTS_0" in attrs and "WEIGHTS_0" in attrs
+                idx = _gltf_accessor(js, bufs, p["indices"]) if "indices" in p else None
+                idx = (idx.ravel().astype(np.int64) if idx is not None
+                       else np.arange(len(pos)) if "indices" not in p else None)
+                if idx is not None and mode == 4:
+                    faces.extend(idx[:len(idx) // 3 * 3].reshape(-1, 3) + nverts)
             ph = np.c_[pos, np.ones(len(pos))]
             if skin_here:
                 J = _gltf_accessor(js, bufs, attrs["JOINTS_0"]).astype(int)
@@ -1663,6 +1875,7 @@ def _measure_gltf(path, height):
             # glTF is Y up with the front at +Z; report in Blender's axes.
             pts.append(np.c_[wp[:, 0], -wp[:, 2], wp[:, 1]])
             labels += [label] * len(wp)
+            nverts += len(wp)
     if not pts:
         raise RuntimeError("No mesh geometry found in the file.")
     P = np.concatenate(pts)
@@ -1670,7 +1883,7 @@ def _measure_gltf(path, height):
     lines = [f"{os.path.basename(path)}: {tris:,} triangles in {prims} primitives "
              f"({len(js.get('meshes', []))} meshes, {len(mats)} materials). Measured at the "
              "rest pose, in Blender's axes (Z up, front -Y); the file itself stores Y up."]
-    lines += _describe_extent(P, labels, height, 0.0)
+    lines += _describe_extent(P, labels, height, 0.0, faces, stats)
     if js.get("skins"):
         lines.append("Skins: " + ", ".join(f"{len(s['joints'])} joints" for s in js["skins"]) + ".")
     anims = js.get("animations", [])
@@ -1687,6 +1900,7 @@ def _measure_gltf(path, height):
         dup = sorted({x for x in names if names.count(x) > 1})
         if dup:
             lines.append(f"Duplicate animation names: {', '.join(dup)}.")
+        lines += _clip_gaps(js, anims, names)
     else:
         lines.append("Animations: none.")
     imgs = js.get("images", [])
@@ -1710,31 +1924,50 @@ def _measure_gltf(path, height):
     return "\n".join(lines)
 
 
-def measure_model(args):
-    path, height = args.get("path"), args.get("height")
-    if path:
-        path = bpy.path.abspath(path)
-        if not os.path.isfile(path):
-            raise RuntimeError(f"No file at {path}.")
-        return _measure_gltf(path, height)
+def _clip_gaps(js, anims, names):
+    """Warn about channels some clips key and others don't. A game engine playing a clip
+    leaves channels it doesn't key at whatever the previous clip set, so a turret that
+    sweeps in idle stays turned in walk."""
+    if len(anims) < 2:
+        return []
+    nodes = js.get("nodes", [])
+    keyed = [{(c["target"]["node"], c["target"].get("path", "?")) for c in a.get("channels", [])
+              if "node" in c.get("target", {})} for a in anims]
+    every = set().union(*keyed)
+    out = []
+    for name, k in zip(names, keyed):
+        miss = sorted(every - k)
+        if not miss:
+            continue
+        desc = ", ".join(f"{nodes[n].get('name', f'node {n}') if n < len(nodes) else n} {path}"
+                         for n, path in miss[:6]) + (" ..." if len(miss) > 6 else "")
+        out.append(f"{name!r} doesn't key {desc}, which other clips animate. When a game "
+                   f"switches to {name!r}, those keep whatever the previous clip left; key them "
+                   "in every clip (export with export_optimize_animation_size=False and "
+                   "export_optimize_animation_keep_anim_object=True).")
+    return out
 
+
+def _measure_scene(args, stats=None, include_hidden=False):
     import numpy as np
 
-    objs, hidden = _target_meshes(args)
+    objs, hidden = _target_meshes(args, include_hidden=include_hidden)
     scene = bpy.context.scene
     orig = (scene.frame_current, scene.frame_subframe)
     frame = args.get("frame")
-    pts, labels, tris = [], [], 0
+    pts, labels, faces, tris, n = [], [], [], 0, 0
     try:
         if frame is not None:
             scene.frame_set(frame)
         dg = bpy.context.evaluated_depsgraph_get()
         for o in objs:
-            p, t = _eval_mesh(o.evaluated_get(dg), tris=True)
+            p, t, f = _eval_mesh(o.evaluated_get(dg), tris=True, faces=True)
             tris += t
             if len(p):
                 pts.append(p)
                 labels += [o.name] * len(p)
+                faces += [x + n for x in f]
+                n += len(p)
     finally:
         scene.frame_set(orig[0], subframe=orig[1])
     if not pts:
@@ -1743,8 +1976,63 @@ def measure_model(args):
             f"{frame if frame is not None else orig[0]}.")
     if hidden:
         head += f" {hidden} hidden meshes left out."
-    return "\n".join([head] + _describe_extent(np.concatenate(pts), labels, height,
-                                                 float(args.get("ground", 0.0))))
+    P = np.concatenate(pts)
+    return "\n".join([head] + _describe_extent(P, labels, args.get("height"),
+                                                 float(args.get("ground", 0.0)),
+                                                 faces, stats))
+
+
+def _compare_lines(a, b, ref_name):
+    """Side-by-side lines for two _extent_stats dicts (a = the model, b = the reference)."""
+    sa, sb = a["hi"] - a["lo"], b["hi"] - b["lo"]
+    rows = [  # (name, model, reference, compare as a ratio)
+        ("Width (X)", float(sa[0]), float(sb[0]), True),
+        ("Depth (Y)", float(sa[1]), float(sb[1]), True),
+        ("Height (Z)", float(sa[2]), float(sb[2]), True),
+        ("Main-body height", a["main_hi"] - a["main_lo"], b["main_hi"] - b["main_lo"], True),
+        ("Main body above the lowest point", max(0.0, a["main_lo"] - float(a["lo"][2])),
+         max(0.0, b["main_lo"] - float(b["lo"][2])), False),
+        ("Thin parts above the main body", max(0.0, float(a["hi"][2]) - a["main_hi"]),
+         max(0.0, float(b["hi"][2]) - b["main_hi"]), False),
+    ]
+    out = [f"Compared with the reference {ref_name} (model vs reference):"]
+    for name, x, y, ratio in rows:
+        if ratio and y > 1e-6:
+            d = f"{(x / y - 1) * 100:+.1f}%"
+        else:
+            d = f"{'+' if x >= y else '-'}{_len(abs(x - y))}"
+        out.append(f"- {name}: {_len(x)} vs {_len(y)} ({d})")
+    ratio = lambda s, m: (m["main_hi"] - m["main_lo"]) / max(float(s[0]), float(s[1]), 1e-9)
+    out.append(f"- Main-body height / widest side: {ratio(sa, a):.2f} vs {ratio(sb, b):.2f} "
+               "(lower is squatter).")
+    return out
+
+
+def measure_model(args):
+    path, ref = args.get("path"), args.get("reference")
+    mine, theirs = {}, {}
+    if path:
+        path = bpy.path.abspath(path)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"No file at {path}.")
+        text = _measure_gltf(path, args.get("height"), mine)
+    else:
+        text = _measure_scene(args, mine)
+    if not ref:
+        return text
+    if ref.lower().endswith((".glb", ".gltf")):
+        rpath = bpy.path.abspath(ref)
+        if not os.path.isfile(rpath):
+            raise RuntimeError(f"No reference file at {rpath}.")
+        _measure_gltf(rpath, None, theirs)
+        rname = os.path.basename(rpath) + " (rest pose)"
+    else:
+        if ref not in bpy.data.objects:
+            raise RuntimeError(f"No reference object named {ref!r}. Pass an object name "
+                               "(its hierarchy is measured, hidden or not) or a .glb path.")
+        _measure_scene({"root": ref, "frame": args.get("frame")}, theirs, include_hidden=True)
+        rname = repr(ref)
+    return "\n".join([text] + _compare_lines(mine, theirs, rname))
 
 
 def _solo_nla(track, drivers):
