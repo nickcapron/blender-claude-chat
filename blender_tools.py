@@ -86,8 +86,9 @@ TOOL_DEFS = [
         "name": "capture_viewport",
         "description": (
             "Take a screenshot of the 3D Viewport exactly as the user sees it, to check your "
-            "work visually. If the screenshot comes back black, an offscreen render of the "
-            "viewport is returned instead and the result says so."
+            "work visually. If the screenshot comes back black, or unchanged although the "
+            "view or scene changed, an offscreen render of the viewport is returned instead "
+            "and the result says so."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -652,7 +653,34 @@ def _png_blocks(src, out, caption):
     ]
 
 
+# (pixel digest, view/scene fingerprint) of the last screenshot that was returned.
+_LAST_SHOT = [None, None]
+
+
+def _view_fingerprint(ov):
+    """What the viewport should show: its view, shading and the visible objects. Only
+    used to tell a stale screenshot from a scene that really hasn't changed."""
+    parts = []
+    space = ov["area"].spaces.active
+    r3d = getattr(space, "region_3d", None)
+    if r3d is not None:
+        parts.append(tuple(round(x, 5) for row in r3d.view_matrix for x in row))
+        parts.append(r3d.view_perspective)
+    with contextlib.suppress(AttributeError):
+        parts.append(space.shading.type)
+    parts.append(bpy.context.scene.frame_current)
+    for o in bpy.context.view_layer.objects:
+        if not o.visible_get():
+            continue
+        data = o.data
+        n = len(data.vertices) if o.type == "MESH" and data is not None else 0
+        parts.append((o.name, n, tuple(round(x, 5) for row in o.matrix_world for x in row)))
+    return hash(tuple(parts))
+
+
 def capture_viewport(args):
+    import hashlib
+
     path = _temp_png("viewport")
     ov = view3d_override()
     if "area" not in ov:
@@ -660,19 +688,39 @@ def capture_viewport(args):
     _remove_file(path)  # never return a stale capture from an earlier call
     note = ""
     err = None
+    fp = _view_fingerprint(ov)
     try:
+        # Changes made from a timer send no redraw notifiers, so draw the window now
+        # rather than read whatever it last put on screen.
+        with contextlib.suppress(Exception):
+            ov["area"].tag_redraw()
+            with bpy.context.temp_override(**ov):
+                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
         with bpy.context.temp_override(**ov):
             bpy.ops.screen.screenshot_area(filepath=path)
         if os.path.exists(path):
-            if not _is_black_file(path):
+            with open(path, "rb") as f:
+                digest = hashlib.sha1(f.read()).hexdigest()
+            stale = digest == _LAST_SHOT[0] and fp != _LAST_SHOT[1]
+            if not stale and not _is_black_file(path):
+                _LAST_SHOT[:] = [digest, fp]
                 return _png_blocks(path, path, "Screenshot of the 3D Viewport")
-            # Screenshots read the window's on-screen image, which can be black when
-            # Blender is minimized or covered. An offscreen draw doesn't depend on that.
-            note = (
-                "The screenshot came back black (Blender's window may be minimized or "
-                "covered), so this is an offscreen render of the viewport instead, without "
-                "overlays."
-            )
+            # Screenshots read the window's on-screen image, which can be black or left
+            # over from an earlier draw when Blender is minimized, covered or not
+            # redrawing. An offscreen draw doesn't depend on that.
+            if stale:
+                note = (
+                    "The screenshot was pixel-identical to the previous one although the "
+                    "view or scene has changed since (Blender's window is not redrawing), "
+                    "so this is an offscreen render of the viewport instead, without "
+                    "overlays."
+                )
+            else:
+                note = (
+                    "The screenshot came back black (Blender's window may be minimized or "
+                    "covered), so this is an offscreen render of the viewport instead, "
+                    "without overlays."
+                )
             _remove_file(path)
     except Exception as e:
         err = e
