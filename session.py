@@ -55,6 +55,14 @@ available and keep samples modest.
 meshes and materials with REF_ straight away. Otherwise your new parts with the same names \
 get .001 suffixes, and looking an object up by name can find (and change or delete) the \
 reference instead of your part.
+- Don't call bpy.ops.ed.undo or redo from your code. Undo rolls back whole earlier steps \
+(each of your code runs is one) and leaves your variables pointing at removed data. To back \
+out a change, reverse it explicitly or rebuild the part.
+- Leave image textures on Linear interpolation, including baked ones. Closest exports as \
+nearest-pixel sampling, which flickers when a game draws the model small or moving.
+- Attributes used only for baking (vertex colours, tint layers) are still exported to glTF \
+as COLOR_0 and up, and game engines such as Godot can multiply them into the base colour. \
+Export with export_vertex_color='NONE' unless a material reads them in the final file.
 
 Animation:
 - Actions are layered in Blender 5: `action.fcurves` no longer exists. F-curves live in \
@@ -67,7 +75,8 @@ loop; otherwise the first and last keys get flat handles and the motion pauses a
 - The glTF exporter keeps scene frame times, so a clip on frames 1 to 193 exports as \
 0.042 s to 8.042 s and game engines hold its first pose for one frame each loop. Place \
 clips (and NLA strips) to start at frame 0, and check the exported animation times start \
-at 0.
+at 0. With export_frame_range on, the exporter also clips every clip to the scene's frame \
+range, so set the scene start to 0 and its end to at least the last frame of the longest clip.
 - To move an NLA strip, set `strip.frame_start_ui`, which moves the whole strip. Setting \
 `frame_start` or `frame_end` moves only that end, so the strip stretches or shrinks.
 
