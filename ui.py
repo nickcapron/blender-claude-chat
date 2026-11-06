@@ -187,6 +187,21 @@ def _ui_text_size(context):
     return pts * context.preferences.system.ui_scale
 
 
+def _drop_pending_text():
+    """Delete the pending-code text block. Left in place it would be saved into the
+    user's .blend."""
+    txt = bpy.data.texts.get(PENDING_TEXT)
+    if txt is not None:
+        bpy.data.texts.remove(txt)
+
+
+def _take_pending():
+    """Take the call awaiting approval (or None) and drop its text block."""
+    call, SESSION.pending = SESSION.pending, None
+    _drop_pending_text()
+    return call
+
+
 def _write_text_block(name, body, show=True):
     txt = bpy.data.texts.get(name) or bpy.data.texts.new(name)
     txt.clear()
@@ -232,6 +247,8 @@ def _tick():
     global _overlay_visible
     s = SESSION
     if s.pending is None:
+        if PENDING_TEXT in bpy.data.texts:  # left over, e.g. in a file saved by an older version
+            _drop_pending_text()
         try:
             call = s.calls.get_nowait()
         except queue.Empty:
@@ -387,8 +404,8 @@ class CLAUDE_OT_stop(bpy.types.Operator):
 
     def execute(self, context):
         SESSION.stop()
-        if SESSION.pending is not None:
-            call, SESSION.pending = SESSION.pending, None
+        call = _take_pending()
+        if call is not None:
             call.finish("Cancelled by the user.", True)
         return {"FINISHED"}
 
@@ -415,7 +432,7 @@ class CLAUDE_OT_approve(bpy.types.Operator):
     always: BoolProperty(default=False, options={"SKIP_SAVE"})
 
     def execute(self, context):
-        call, SESSION.pending = SESSION.pending, None
+        call = _take_pending()
         if call is None:
             return {"CANCELLED"}
         if self.always:
@@ -431,7 +448,7 @@ class CLAUDE_OT_reject(bpy.types.Operator):
 
     def execute(self, context):
         global _suppress_prompt_update
-        call, SESSION.pending = SESSION.pending, None
+        call = _take_pending()
         if call is None:
             return {"CANCELLED"}
         props = context.window_manager.claude_chat
@@ -946,6 +963,9 @@ def unregister():
     SESSION.stop()
     if SESSION.pending is not None:
         SESSION.pending.finish("Add-on was disabled.", True)
+    try:
+        _take_pending()
+    except Exception:  # bpy.data can be unavailable while Blender shuts down
         SESSION.pending = None
     bridge.stop()
     bpy.types.VIEW3D_MT_editor_menus.remove(_draw_header_button)
