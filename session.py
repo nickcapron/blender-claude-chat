@@ -99,7 +99,9 @@ Renaming re-sorts a bpy.data collection, so looping over it directly visits item
 and stacks prefixes until the 63-character limit cuts the names off.
 - Write only the files the task asks for into its output folder. Put test renders and \
 other scratch files in bpy.app.tempdir.
-- bmesh: bmesh.ops.inset_individual and inset_region return the new rim faces in 'faces'; \
+- bmesh: faces made with bm.faces.new have no normal until you call bm.normal_update() \
+(or bmesh.ops.recalc_face_normals), so selecting faces by normal before that picks the \
+wrong ones. bmesh.ops.inset_individual and inset_region return the new rim faces in 'faces'; \
 the faces you passed in stay as the inner panels. bmesh.ops.bevel replaces the faces next \
 to the edges it bevels, so face references and indices taken before it no longer point at \
 the same faces, and selecting edges by angle after insets also bevels every inset step. For \
@@ -126,9 +128,17 @@ the middle of its geometry for a pulsing light or a spinning drum, the hinge for
 door. A glow whose origin sits at the hull's centre metres away slides back and forth as it \
 pulses instead of swelling in place. Parts that share a mesh's origin by default (all \
 built at one location, then edited in Edit Mode) are the usual cause.
+- Pose bones rotate and move in their own local axes, not the world's: local Y runs along \
+the bone, and X and Z depend on its direction and roll. A leg bone pointing down has local \
+Y pointing down, and a hips bone pointing up moves up along local Y. To turn a bone around \
+a world axis, convert: R = bone.matrix_local.to_3x3(); local = R.inverted() @ world_rot @ R \
+(and R.inverted() @ world_offset for a location). Test the sign of one key on one bone \
+before keying a whole cycle.
 - For a walk or run, the feet that carry the weight should rest on the ground and not \
 sink into it, with the body lowest just after a foot lands and highest as the legs pass. \
-check_ground_contact shows this.
+check_ground_contact shows this. In a cycle made in place, the planted foot should move \
+back at a steady speed; tell the user that speed, since the game must move the unit at it \
+for the feet not to slide.
 - For a looping clip, give the F-curves a Cycles modifier so auto handles wrap around the \
 loop; otherwise the first and last keys get flat handles and the motion pauses at the seam.
 - The glTF exporter keeps scene frame times, so a clip on frames 1 to 193 exports as \
@@ -158,7 +168,9 @@ from before later steps doesn't cover them. For an exported file, check the file
 with measure_model (path=...). A glTF mesh has one primitive per material, so a bound or \
 count read from one primitive misses the rest.
 - Only report what you checked. If you didn't verify something, say so instead of \
-describing it as done.
+describing it as done. When you summarise a check, keep its verdict: don't report a pass \
+where the tool reported a problem, such as "no sliding" when check_ground_contact gave a \
+ground speed. Any change after a check, even zeroing one channel, needs that check run again.
 - If you notice something in your result that misses the spec and you can fix it (a \
 detail placed where it can't be seen, a part that lost its bevel, a model taller than the \
 reference), fix it and check again before you finish rather than listing it as a caveat.
