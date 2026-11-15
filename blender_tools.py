@@ -324,7 +324,9 @@ TOOL_DEFS = [
             "engine and colour management and its own sun (lighting='scene' uses the scene's "
             "lights instead), hides other objects for the render, and restores every scene "
             "setting afterwards. A unit turns on the map, so pass azimuths (for example "
-            "[30, 120, 210]) to see it from several sides in one image. Also counts the model's bright, saturated "
+            "[30, 120, 210]) to see it from several sides in one image. Counts the glow "
+            "pixels (those showing a material with emission, found by a second render with "
+            "those materials black) and gives their average colour. Also counts the model's bright, saturated "
             "pixels by hue (teal, violet and so on), to show which glows still read. With path "
             "it tests an exported file. Use it whenever a spec says how many pixels tall the "
             "game draws the model."
@@ -2717,9 +2719,12 @@ def _map_test(args, objs, glb):
     hidden = []  # objects whose hide_render this call switched on
     temp = []  # (object, data) created here
     paths = [_temp_png(f"maptest_raw{i}") for i in range(len(az_degs))]
+    mask_paths = [_temp_png(f"maptest_mask{i}") for i in range(len(az_degs))]
     out = _temp_png("maptest")
-    for p in paths + [out]:
+    for p in paths + mask_paths + [out]:
         _remove_file(p)
+    glow_mats = _emissive_materials(objs)
+    unblack = []  # functions that undo the blacked-out glow materials
     try:
         vt = args.get("view_transform")
         if vt:
@@ -2794,6 +2799,7 @@ def _map_test(args, objs, glb):
         if max(total_w, max(v[3] for v in views)) > 1024:
             raise RuntimeError(f"The test would be {total_w}x{max(v[3] for v in views)} px; pass "
                                "a smaller px_height, a larger metres_per_px or fewer azimuths.")
+        shots = []
         for (rot, cam_pos, W, Ht), az_deg, path in zip(views, az_degs, paths):
             cd = bpy.data.cameras.new("claude_map_test_cam")
             cd.type = "ORTHO"
@@ -2805,14 +2811,31 @@ def _map_test(args, objs, glb):
             temp.append((cam, cd))
             scene.collection.objects.link(cam)
             cam.matrix_world = Matrix.Translation(cam_pos) @ rot.to_4x4()
+            sun_rot = None
             if sun is not None:  # the same light in every view: it turns with the camera
                 to_sun = direction(math.radians(az_deg - 40), math.radians(50))
-                sun.rotation_euler = to_sun.to_track_quat("Z", "Y").to_euler()
+                sun_rot = to_sun.to_track_quat("Z", "Y").to_euler()
+                sun.rotation_euler = sun_rot
             scene.camera = cam
             rd.resolution_x, rd.resolution_y = W, Ht
             bpy.ops.render.render(write_still=False)
             bpy.data.images["Render Result"].save_render(path)
+            shots.append((cam, sun_rot, W, Ht))
+        # The same views again with every emissive material black: the pixels that change
+        # are the ones showing a glow, whatever its colour and however the view transform
+        # washes it out.
+        if glow_mats:
+            unblack.extend(_black_out(m) for m in glow_mats)
+            for (cam, sun_rot, W, Ht), path in zip(shots, mask_paths):
+                if sun_rot is not None:
+                    sun.rotation_euler = sun_rot
+                scene.camera = cam
+                rd.resolution_x, rd.resolution_y = W, Ht
+                bpy.ops.render.render(write_still=False)
+                bpy.data.images["Render Result"].save_render(path)
     finally:
+        for undo in unblack:
+            undo()
         scene.camera = saved["camera"]
         rd.resolution_x, rd.resolution_y, rd.resolution_percentage = saved["res"]
         rd.film_transparent = saved["film"]
@@ -2835,20 +2858,23 @@ def _map_test(args, objs, glb):
         scene.frame_set(orig_frame[0], subframe=orig_frame[1])
 
     comps, per_view, colorspace = [], [], None
-    for path, az_deg in zip(paths, az_degs):
+    def read(path):
         if not os.path.isfile(path):
             raise RuntimeError("The render wrote no image.")
         img = bpy.data.images.load(path, check_existing=False)
         try:
             w, h = img.size
             ch = img.channels
-            colorspace = img.colorspace_settings.name
+            space = img.colorspace_settings.name
             px = np.empty(w * h * ch, dtype=np.float32)
             img.pixels.foreach_get(px)
         finally:
             bpy.data.images.remove(img)
         _remove_file(path)
-        px = px.reshape(h, w, ch)
+        return px.reshape(h, w, ch), w, h, ch, space
+
+    for path, mask_path, az_deg in zip(paths, mask_paths, az_degs):
+        px, w, h, ch, colorspace = read(path)
         rgb = px[:, :, :3]
         a = px[:, :, 3] if ch == 4 else np.ones((h, w), dtype=np.float32)
         solid = a > 0.5
@@ -2864,7 +2890,11 @@ def _map_test(args, objs, glb):
                     f"{int(ys.max() - ys.min() + 1)} px (wide x tall) of the {w}x{h} image")
         else:
             size = "nothing rendered: the model is not visible from this camera"
-        per_view.append((az_deg, size, _glow_pixels(comp, solid)))
+        glow = None  # no emissive material
+        if glow_mats:
+            dark = read(mask_path)[0]
+            glow = solid & (np.abs(rgb - dark[:, :, :3]).max(axis=2) > 0.04)
+        per_view.append((az_deg, size, _glow_pixels(comp, solid, glow)))
 
     # The views side by side on the map colour, centred vertically.
     h = max(c.shape[0] for c in comps)
@@ -2916,29 +2946,89 @@ def _map_test(args, objs, glb):
     return blocks
 
 
-def _glow_pixels(comp, solid):
-    """One sentence counting the model's bright, saturated pixels in a map test by hue, so
-    'the glowing lines read' has a number behind it. comp is h x w x 3 sRGB 0-1."""
+def _emissive_materials(objs):
+    """The materials on these objects that emit light: a Principled BSDF or Emission node
+    with a strength above zero (or driven by other nodes)."""
+    out = []
+    for o in objs:
+        for slot in o.material_slots:
+            m = slot.material
+            if m is None or m in out or not m.node_tree:
+                continue
+            for n in m.node_tree.nodes:
+                if n.type == "BSDF_PRINCIPLED":
+                    s_in, c_in = n.inputs.get("Emission Strength"), n.inputs.get("Emission Color")
+                elif n.type == "EMISSION":
+                    s_in, c_in = n.inputs.get("Strength"), n.inputs.get("Color")
+                else:
+                    continue
+                if s_in is None or not (s_in.is_linked or s_in.default_value > 1e-4):
+                    continue
+                if c_in is not None and not c_in.is_linked and max(c_in.default_value[:3]) <= 1e-4:
+                    continue
+                out.append(m)
+                break
+    return out
+
+
+def _black_out(mat):
+    """Make a material render black and unlit. Returns a function that puts it back."""
+    nt = mat.node_tree
+    outs = [n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"]
+    black = nt.nodes.new("ShaderNodeEmission")
+    black.inputs["Color"].default_value = (0, 0, 0, 1)
+    black.inputs["Strength"].default_value = 0.0
+    was = []
+    for n in outs:
+        surf = n.inputs["Surface"]
+        was.append((surf, surf.links[0].from_socket if surf.is_linked else None))
+        nt.links.new(black.outputs[0], surf)
+
+    def undo():
+        for surf, src in was:
+            if src is not None:
+                nt.links.new(src, surf)
+            else:
+                for link in list(surf.links):
+                    nt.links.remove(link)
+        nt.nodes.remove(black)
+    return undo
+
+
+def _glow_pixels(comp, solid, glow=None):
+    """Sentences counting a map test's glow pixels (glow: the mask of pixels that show an
+    emissive material, or None when the model has none) and its bright, saturated pixels
+    of any material by hue. comp is h x w x 3 sRGB 0-1."""
     import numpy as np
 
     rgb = comp[solid]
     if not len(rgb):
         return ""
+    if glow is None:
+        first = "Glow pixels: none, the model has no material with emission."
+    else:
+        n = int(glow.sum())
+        if not n:
+            first = ("Glow pixels (showing a material with emission): none, so no glow "
+                     "shows from here at this size.")
+        else:
+            mean = comp[glow].mean(axis=0)
+            first = (f"Glow pixels (showing a material with emission): {n} of {len(rgb)} "
+                     f"model pixels, average colour {_hex(mean)} ({_hsv_words(mean)})."
+                     + (" One or two pixels don't read at this size." if n <= 2 else ""))
     mx, mn = rgb.max(axis=1), rgb.min(axis=1)
     sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
     bright = (mx >= 0.6) & (sat >= 0.4)
     if not bright.any():
-        return ("Bright, saturated pixels (glows, or brightly painted parts): none, so no "
-                "glow reads at this size.")
+        return first + " Bright, saturated pixels of any material (value 60%+, saturation 40%+): none."
     counts = {}
     for c in rgb[bright]:
         hue, s_, _ = _hsv(c)
         name = _hue_name(hue, s_)
         counts[name] = counts.get(name, 0) + 1
     parts = ", ".join(f"{n} {name}" for name, n in sorted(counts.items(), key=lambda kv: -kv[1]))
-    return (f"Bright, saturated pixels (value 60%+, saturation 40%+: glows, or brightly "
-            f"painted parts) by hue: {parts}, of {len(rgb)} model pixels. A glow with no "
-            "pixels here, or only one or two, doesn't read at this size.")
+    return (first + " Bright, saturated pixels of any material, paint as well as glow (value "
+            f"60%+, saturation 40%+), by hue: {parts}.")
 
 
 HANDLERS = {

@@ -109,9 +109,11 @@ and bake again rather than scaling the baked pixels.
 - When a spec says how many pixels tall or wide a game draws the model, run \
 render_map_test with that size (and metres_per_px if the spec gives a pixel size) rather \
 than setting up a camera yourself, and check that the outline and any glowing lines still \
-read: the tool counts the bright pixels of each hue, and a glow with none (or only one or \
-two) doesn't read. Give that count when you say a glow reads. The count depends on the view \
-transform (AgX washes glows out to pale, so they drop out of the count), so pass \
+read: the tool counts the glow pixels (those showing a material with emission) and gives \
+their average colour, and a glow with none (or only one or two) doesn't read. Give that \
+count when you say a glow reads. Its separate count of bright, saturated pixels includes \
+paint, so don't quote that one as a glow count. The glow's colour depends on the view \
+transform (AgX washes glows out to pale), so pass \
 view_transform when the spec names the game's tonemapper. A glow's colour or strength \
 changes the count too, so after changing either, run the map test again (with path= on \
 the new export) and give the new count. Details under about one pixel wide disappear. If the spec doesn't give the map's view \
@@ -141,6 +143,9 @@ also writes meshes and animations from the other scenes into the file.
 every object in the view layer) while everything is still visible, then select the model. \
 bpy.ops.object.select_all skips objects that are hidden or in a hidden collection, so a \
 reference you imported and then hid stays selected and is exported with the model.
+- When a size or position must match a reference file exactly, copy the coordinate stored \
+in the reference (its vertex, in the same object's local space) rather than typing a \
+rounded figure from the brief: a game may compare the numbers bit for bit.
 - When a task gives steps to do for each model (views to capture, checks to run), do every \
 step on every model in the batch, the last one as fully as the first. If you leave a step \
 out, say which and why in the final report.
