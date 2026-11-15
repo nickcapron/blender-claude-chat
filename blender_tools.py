@@ -321,8 +321,10 @@ TOOL_DEFS = [
             "one pixel is height / px_height), framed so the whole model fits with a margin, "
             "with the dark outline the game adds, over a dark map colour. Returns the image "
             "enlarged pixel for pixel and the model's size in pixels. Uses the scene's render "
-            "engine, lights and colour management, hides other objects for the render, and "
-            "restores every scene setting afterwards. Also counts the model's bright, saturated "
+            "engine and colour management and its own sun (lighting='scene' uses the scene's "
+            "lights instead), hides other objects for the render, and restores every scene "
+            "setting afterwards. A unit turns on the map, so pass azimuths (for example "
+            "[30, 120, 210]) to see it from several sides in one image. Also counts the model's bright, saturated "
             "pixels by hue (teal, violet and so on), to show which glows still read. With path "
             "it tests an exported file. Use it whenever a spec says how many pixels tall the "
             "game draws the model."
@@ -346,6 +348,24 @@ TOOL_DEFS = [
                 "azimuth": {
                     "type": "number",
                     "description": "Camera direction in degrees around the model, 0 = in front (-Y), 90 = on its +X side (default 30).",
+                },
+                "azimuths": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Several camera directions in one call (up to 6, instead of azimuth): "
+                        "the views are returned side by side, left to right, with the size and "
+                        "glow count of each."
+                    ),
+                },
+                "lighting": {
+                    "type": "string",
+                    "enum": ["sun", "scene"],
+                    "description": (
+                        "'sun' (default): the scene's lights are left out and one sun lights "
+                        "the model from above and to the side of the camera, the same in every "
+                        "view. 'scene': the scene's own lights."
+                    ),
                 },
                 "outline_px": {
                     "type": "integer",
@@ -462,6 +482,16 @@ def validate(name, args):
             if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool)
                                   or not lo <= v <= hi):
                 return f"{key} must be a number from {lo:g} to {hi:g}."
+        azs = args.get("azimuths")
+        if azs is not None:
+            if args.get("azimuth") is not None:
+                return "Pass azimuth or azimuths, not both."
+            if (not isinstance(azs, list) or not 1 <= len(azs) <= 6
+                    or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                           or not -180 <= v <= 360 for v in azs)):
+                return "azimuths must be a list of 1 to 6 numbers from -180 to 360."
+        if args.get("lighting") not in (None, "sun", "scene"):
+            return "lighting must be 'sun' or 'scene'."
         fr = args.get("frame")
         if fr is not None and (not isinstance(fr, int) or isinstance(fr, bool)):
             return "frame must be an integer."
@@ -1954,7 +1984,7 @@ def _offset_words(x, y):
     return " and ".join(out) or "on the origin"
 
 
-def _centre_lines(P, lo, hi):
+def _centre_lines(P, lo, hi, info=None):
     """Lines flagging a model whose bounding box, or the points it stands on, are off the
     origin in X/Y (a game places a unit by its origin)."""
     size = hi - lo
@@ -1986,6 +2016,9 @@ def _centre_lines(P, lo, hi):
         "A game places a unit by its origin, so if the spec asks for the model centred, "
         "move it (the root object or armature, not mesh data inside an animated hierarchy) "
         "and say whether you centred the bounding box or the footprint.")
+    if info is not None:
+        info.update(centre_lines=lines, centre_box=(cx, cy), centre_side=side,
+                    centre_feet=None if fx is None else (fx, fy))
     return lines
 
 
@@ -2010,7 +2043,7 @@ def _describe_extent(P, labels, height, ground, faces=None, stats=None):
         f"Bounding-box centre: ({(lo[0] + hi[0]) / 2:.3f}, {(lo[1] + hi[1]) / 2:.3f}, "
         f"{(lo[2] + hi[2]) / 2:.3f}).",
     ]
-    lines += _centre_lines(P, lo, hi)
+    lines += _centre_lines(P, lo, hi, stats)
     gap = float(lo[2]) - ground
     if abs(gap) <= max(1e-4, H * 1e-3):
         lines.append(f"Lowest point is on the ground (z = {ground:g}).")
@@ -2355,6 +2388,30 @@ def _compare_lines(a, b, ref_name):
     return out
 
 
+def _same_offset_as_reference(text, a, b):
+    """The model's report with its off-centre warning cut to one line when the reference is
+    off the origin in the same way (a tank whose barrel overhangs, like the file it
+    replaces). a and b are the stats of the model and the reference."""
+    la, lb = a.get("centre_lines"), b.get("centre_lines")
+    if not la or not lb:  # either one is centred, or wasn't measured
+        return text
+    tol = max(0.01, 0.02 * max(a["centre_side"], b["centre_side"]))
+    pairs = [(a["centre_box"], b["centre_box"])]
+    if (a["centre_feet"] is None) != (b["centre_feet"] is None):
+        return text
+    if a["centre_feet"] is not None:
+        pairs.append((a["centre_feet"], b["centre_feet"]))
+    if any(math.hypot(p[0] - q[0], p[1] - q[1]) > tol for p, q in pairs):
+        return text
+    line = (f"Off the origin in the same way as the reference (within {_len(tol)}): the "
+            f"bounding-box centre is {_offset_words(*a['centre_box'])} (reference: "
+            f"{_offset_words(*b['centre_box'])})")
+    if a["centre_feet"] is not None:
+        line += (f"; the points it stands on have their centre {_offset_words(*a['centre_feet'])} "
+                 f"(reference: {_offset_words(*b['centre_feet'])})")
+    return text.replace("\n".join(la), line + ".")
+
+
 def measure_model(args):
     path, ref = args.get("path"), args.get("reference")
     mine, theirs = {}, {}
@@ -2379,7 +2436,8 @@ def measure_model(args):
                                "(its hierarchy is measured, hidden or not) or a .glb path.")
         _measure_scene({"root": ref, "frame": args.get("frame")}, theirs, include_hidden=True)
         rname = repr(ref)
-    return "\n".join([text] + _compare_lines(mine, theirs, rname))
+    return "\n".join([_same_offset_as_reference(text, mine, theirs)]
+                     + _compare_lines(mine, theirs, rname))
 
 
 def _nla_refresh(tracks):
@@ -2532,6 +2590,7 @@ def check_ground_contact(args):
 
 
 MAP_MARGIN_PX = 3  # empty pixels around the model in a map test
+MAP_VIEW_GAP_PX = 4  # map colour between the views when several azimuths are rendered
 
 # Every kind of datablock the glTF importer can create (a multi-scene file adds scenes,
 # POINTS primitives add point clouds). Kinds this Blender lacks are skipped when the tool
@@ -2641,7 +2700,8 @@ def _map_test(args, objs, glb):
     rd = scene.render
     px_h = int(args["px_height"])
     el = math.radians(float(args.get("elevation", 55)))
-    az = math.radians(float(args.get("azimuth", 30)))
+    az_degs = [float(v) for v in (args.get("azimuths") or [args.get("azimuth", 30)])]
+    lighting = args.get("lighting") or "sun"
     outline = int(args.get("outline_px", 1))
     bg_hex = (args.get("background") or "#2a2b32").lstrip("#")
     bg = np.array([int(bg_hex[i:i + 2], 16) / 255 for i in (0, 2, 4)], dtype=np.float32)
@@ -2656,9 +2716,9 @@ def _map_test(args, objs, glb):
     }
     hidden = []  # objects whose hide_render this call switched on
     temp = []  # (object, data) created here
-    path = _temp_png("maptest_raw")
+    paths = [_temp_png(f"maptest_raw{i}") for i in range(len(az_degs))]
     out = _temp_png("maptest")
-    for p in (path, out):
+    for p in paths + [out]:
         _remove_file(p)
     try:
         vt = args.get("view_transform")
@@ -2678,43 +2738,27 @@ def _map_test(args, objs, glb):
         if H <= 1e-6:
             raise RuntimeError("The model has no height.")
         mpp = float(args.get("metres_per_px") or H / px_h)
-
-        # Orthographic camera looking at the model from (azimuth, elevation).
-        d = Vector((math.sin(az) * math.cos(el), -math.cos(az) * math.cos(el), math.sin(el)))
         centre = Vector(((lo + hi) / 2).tolist())
         dist = float(np.linalg.norm(hi - lo)) * 2 + 10
-        rot = (-d).to_track_quat("-Z", "Y").to_matrix()
-        cam_pos = centre + d * dist
-        # Camera-space x/y of every point, to frame the model exactly.
-        R = np.array(rot, dtype=np.float64)
-        Q = (P - np.array(cam_pos)) @ R  # columns: camera x, y, -depth
-        x0, x1 = float(Q[:, 0].min()), float(Q[:, 0].max())
-        y0, y1 = float(Q[:, 1].min()), float(Q[:, 1].max())
-        W = int(math.ceil((x1 - x0) / mpp)) + 2 * MAP_MARGIN_PX
-        Ht = int(math.ceil((y1 - y0) / mpp)) + 2 * MAP_MARGIN_PX
-        if max(W, Ht) > 1024:
-            raise RuntimeError(f"The test would be {W}x{Ht} px; pass a smaller px_height "
-                               "or a larger metres_per_px.")
-        cam_pos = cam_pos + rot @ Vector(((x0 + x1) / 2, (y0 + y1) / 2, 0))
-        cd = bpy.data.cameras.new("claude_map_test_cam")
-        cd.type = "ORTHO"
-        cd.ortho_scale = max(W, Ht) * mpp
-        cd.sensor_fit = "AUTO"
-        cd.clip_start = 0.01
-        cd.clip_end = dist * 3
-        cam = bpy.data.objects.new("claude_map_test_cam", cd)
-        temp.append((cam, cd))
-        scene.collection.objects.link(cam)
-        cam.matrix_world = Matrix.Translation(cam_pos) @ rot.to_4x4()
 
-        # A sun if the scene has no light that renders, so the test isn't black.
-        if not any(o.type == "LIGHT" and not o.hide_render for o in scene.objects):
+        # The tool's own sun, unless the scene's lights were asked for (and there are any).
+        scene_lights = [o for o in scene.objects if o.type == "LIGHT" and not o.hide_render]
+        sun = None
+        if lighting == "sun" or not scene_lights:
+            for o in scene_lights:
+                o.hide_render = True
+                hidden.append(o)
             ld = bpy.data.lights.new("claude_map_test_sun", "SUN")
             ld.energy = 3.0
             sun = bpy.data.objects.new("claude_map_test_sun", ld)
             temp.append((sun, ld))
             scene.collection.objects.link(sun)
-            sun.rotation_euler = (math.radians(40), 0, math.radians(30))
+            lit = ("the tool's own sun, 40 deg to the left of the camera"
+                   + ("" if lighting == "sun" else " (the scene has no light that renders)"))
+        else:
+            kinds = ", ".join(sorted({o.data.type.lower() for o in scene_lights}))
+            lit = (f"the scene's {len(scene_lights)} light{'s' if len(scene_lights) != 1 else ''} "
+                   f"({kinds}); a side facing away from them is in shadow")
 
         keep = set(objs) | {t[0] for t in temp}
         for o in scene.objects:
@@ -2722,15 +2766,52 @@ def _map_test(args, objs, glb):
                 o.hide_render = True
                 hidden.append(o)
 
-        scene.camera = cam
-        rd.resolution_x, rd.resolution_y, rd.resolution_percentage = W, Ht, 100
+        rd.resolution_percentage = 100
         rd.pixel_aspect_x = rd.pixel_aspect_y = 1
         rd.use_border = False
         rd.film_transparent = True
         rd.image_settings.file_format = "PNG"
         rd.image_settings.color_mode = "RGBA"
-        bpy.ops.render.render(write_still=False)
-        bpy.data.images["Render Result"].save_render(path)
+
+        def direction(a, e):
+            return Vector((math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)))
+
+        # One orthographic camera per view, looking at the model from (azimuth, elevation).
+        views = []
+        for az_deg in az_degs:
+            d = direction(math.radians(az_deg), el)
+            rot = (-d).to_track_quat("-Z", "Y").to_matrix()
+            cam_pos = centre + d * dist
+            # Camera-space x/y of every point, to frame the model exactly.
+            R = np.array(rot, dtype=np.float64)
+            Q = (P - np.array(cam_pos)) @ R  # columns: camera x, y, -depth
+            x0, x1 = float(Q[:, 0].min()), float(Q[:, 0].max())
+            y0, y1 = float(Q[:, 1].min()), float(Q[:, 1].max())
+            W = int(math.ceil((x1 - x0) / mpp)) + 2 * MAP_MARGIN_PX
+            Ht = int(math.ceil((y1 - y0) / mpp)) + 2 * MAP_MARGIN_PX
+            views.append((rot, cam_pos + rot @ Vector(((x0 + x1) / 2, (y0 + y1) / 2, 0)), W, Ht))
+        total_w = sum(v[2] for v in views) + MAP_VIEW_GAP_PX * (len(views) - 1)
+        if max(total_w, max(v[3] for v in views)) > 1024:
+            raise RuntimeError(f"The test would be {total_w}x{max(v[3] for v in views)} px; pass "
+                               "a smaller px_height, a larger metres_per_px or fewer azimuths.")
+        for (rot, cam_pos, W, Ht), az_deg, path in zip(views, az_degs, paths):
+            cd = bpy.data.cameras.new("claude_map_test_cam")
+            cd.type = "ORTHO"
+            cd.ortho_scale = max(W, Ht) * mpp
+            cd.sensor_fit = "AUTO"
+            cd.clip_start = 0.01
+            cd.clip_end = dist * 3
+            cam = bpy.data.objects.new("claude_map_test_cam", cd)
+            temp.append((cam, cd))
+            scene.collection.objects.link(cam)
+            cam.matrix_world = Matrix.Translation(cam_pos) @ rot.to_4x4()
+            if sun is not None:  # the same light in every view: it turns with the camera
+                to_sun = direction(math.radians(az_deg - 40), math.radians(50))
+                sun.rotation_euler = to_sun.to_track_quat("Z", "Y").to_euler()
+            scene.camera = cam
+            rd.resolution_x, rd.resolution_y = W, Ht
+            bpy.ops.render.render(write_still=False)
+            bpy.data.images["Render Result"].save_render(path)
     finally:
         scene.camera = saved["camera"]
         rd.resolution_x, rd.resolution_y, rd.resolution_percentage = saved["res"]
@@ -2753,14 +2834,20 @@ def _map_test(args, objs, glb):
                 bpy.data.lights.remove(data)
         scene.frame_set(orig_frame[0], subframe=orig_frame[1])
 
-    if not os.path.isfile(path):
-        raise RuntimeError("The render wrote no image.")
-    img = bpy.data.images.load(path, check_existing=False)
-    try:
-        w, h = img.size
-        ch = img.channels
-        px = np.empty(w * h * ch, dtype=np.float32)
-        img.pixels.foreach_get(px)
+    comps, per_view, colorspace = [], [], None
+    for path, az_deg in zip(paths, az_degs):
+        if not os.path.isfile(path):
+            raise RuntimeError("The render wrote no image.")
+        img = bpy.data.images.load(path, check_existing=False)
+        try:
+            w, h = img.size
+            ch = img.channels
+            colorspace = img.colorspace_settings.name
+            px = np.empty(w * h * ch, dtype=np.float32)
+            img.pixels.foreach_get(px)
+        finally:
+            bpy.data.images.remove(img)
+        _remove_file(path)
         px = px.reshape(h, w, ch)
         rgb = px[:, :, :3]
         a = px[:, :, 3] if ch == 4 else np.ones((h, w), dtype=np.float32)
@@ -2770,41 +2857,60 @@ def _map_test(args, objs, glb):
             ring = _dilate(solid, outline) & ~solid
             under[ring] = ink
         comp = rgb * a[..., None] + under * (1 - a[..., None])
-        flat = np.concatenate([comp, np.ones((h, w, 1), dtype=np.float32)], axis=2)
-        res = bpy.data.images.new("claude_map_test", w, h, alpha=True)
-        try:
-            res.colorspace_settings.name = img.colorspace_settings.name
-            res.pixels.foreach_set(flat.ravel())
-            res.filepath_raw = out
-            res.file_format = "PNG"
-            res.save()
-        finally:
-            bpy.data.images.remove(res)
-    finally:
-        bpy.data.images.remove(img)
-    _remove_file(path)
+        comps.append(comp)
+        ys, xs = np.nonzero(solid)
+        if len(xs):
+            size = (f"the model covers {int(xs.max() - xs.min() + 1)} x "
+                    f"{int(ys.max() - ys.min() + 1)} px (wide x tall) of the {w}x{h} image")
+        else:
+            size = "nothing rendered: the model is not visible from this camera"
+        per_view.append((az_deg, size, _glow_pixels(comp, solid)))
 
-    glow = _glow_pixels(comp, solid)
-    ys, xs = np.nonzero(solid)
-    if len(xs):
-        sw, sh = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
-        size = f"The model covers {sw} x {sh} px (wide x tall) of the {w}x{h} image"
-    else:
-        size = "Nothing rendered: the model is not visible from this camera"
+    # The views side by side on the map colour, centred vertically.
+    h = max(c.shape[0] for c in comps)
+    cols = []
+    for i, c in enumerate(comps):
+        if i:
+            cols.append(np.broadcast_to(bg, (h, MAP_VIEW_GAP_PX, 3)))
+        pad = h - c.shape[0]
+        if pad:
+            below = np.broadcast_to(bg, (pad // 2, c.shape[1], 3))
+            above = np.broadcast_to(bg, (pad - pad // 2, c.shape[1], 3))
+            c = np.concatenate([below, c, above], axis=0)
+        cols.append(c)
+    strip = np.concatenate(cols, axis=1).astype(np.float32)
+    w = strip.shape[1]
+    flat = np.concatenate([strip, np.ones((h, w, 1), dtype=np.float32)], axis=2)
+    res = bpy.data.images.new("claude_map_test", w, h, alpha=True)
+    try:
+        res.colorspace_settings.name = colorspace
+        res.pixels.foreach_set(flat.ravel())
+        res.filepath_raw = out
+        res.file_format = "PNG"
+        res.save()
+    finally:
+        bpy.data.images.remove(res)
+
+    az_words = (f"azimuth {az_degs[0]:g} deg (0 = front)" if len(az_degs) == 1 else
+                f"{len(az_degs)} views side by side, left to right at azimuth "
+                + ", ".join(f"{v:g}" for v in az_degs) + " deg (0 = front)")
     note = (f"Map test: 1 px = {_len(mpp)} (model height {_len(H)} / "
             f"{'metres_per_px' if args.get('metres_per_px') else str(px_h) + ' px'}), "
-            f"orthographic, {math.degrees(el):g} deg above the horizon, azimuth "
-            f"{math.degrees(az):g} deg (0 = front), "
+            f"orthographic, {math.degrees(el):g} deg above the horizon, {az_words}, "
             + (f"{outline} px dark outline" if outline else "no outline")
-            + f", {MAP_MARGIN_PX} px margin, view transform {view_used}"
+            + f", {MAP_MARGIN_PX} px margin, lit by {lit}, view transform {view_used}"
             + ("" if args.get("view_transform") else " (the scene's; pass view_transform to "
                "match the game's tonemapper)")
-            + f". {size}. In a view from above the model looks "
+            + ". In a view from above the model looks "
             "taller in pixels than px_height, because its depth shows too.")
     if glb:
         note = (f"{os.path.basename(glb)}, in the pose the file stores (no clip playing). "
                 + note)
-    note += " " + glow
+    if len(per_view) == 1:
+        _, size, glow = per_view[0]
+        note += f" {size[0].upper()}{size[1:]}. {glow}"
+    else:
+        note += "".join(f"\n- Azimuth {v:g}: {size}. {glow}" for v, size, glow in per_view) + "\n"
     blocks = _png_blocks(out, out, "Map test render", stats=True)
     blocks[-1]["text"] = note + " " + blocks[-1]["text"]
     return blocks

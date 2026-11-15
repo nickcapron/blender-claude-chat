@@ -137,6 +137,13 @@ match the shape, and stretched faces stretch the texture.
 - When the file holds more than one scene (appended models, a reference scene), export \
 glTF with use_active_scene=True as well as use_selection=True. Without it the exporter \
 also writes meshes and animations from the other scenes into the file.
+- Before an export with use_selection=True, deselect with a loop (o.select_set(False) for \
+every object in the view layer) while everything is still visible, then select the model. \
+bpy.ops.object.select_all skips objects that are hidden or in a hidden collection, so a \
+reference you imported and then hid stays selected and is exported with the model.
+- When a task gives steps to do for each model (views to capture, checks to run), do every \
+step on every model in the batch, the last one as fully as the first. If you leave a step \
+out, say which and why in the final report.
 - When you import a reference model, put it in its own collection and prefix its objects, \
 meshes and materials with REF_ straight away. Otherwise your new parts with the same names \
 get .001 suffixes, and looking an object up by name can find (and change or delete) the \
