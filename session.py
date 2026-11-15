@@ -135,7 +135,10 @@ bake. Once parts are joined you can't select one by name or by its old bounding 
 change the mesh after a bake, bake again; otherwise the baked shading and grime no longer \
 match the shape, and stretched faces stretch the texture.
 - To use another .blend while working in the open one, append or link from it \
-(bpy.data.libraries.load) rather than opening it, which would replace the user's scene.
+(bpy.data.libraries.load) rather than opening it, which would replace the user's scene. \
+After appending, Blender keeps a library entry for that file and refuses to save over it \
+("Cannot overwrite used library"): when you will save back to the same path, remove the \
+entry first (bpy.data.libraries.remove(lib), once nothing is still linked from it).
 - When the file holds more than one scene (appended models, a reference scene), export \
 glTF with use_active_scene=True as well as use_selection=True. Without it the exporter \
 also writes meshes and animations from the other scenes into the file.
