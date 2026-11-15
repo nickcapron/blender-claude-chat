@@ -8,6 +8,7 @@ import json
 import linecache
 import math
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -107,7 +108,11 @@ TOOL_DEFS = [
             "capture_viewport shows the viewport instead. The result gives the average colour "
             "and lightness of the subject (a plain background is left out), to check colour "
             "words such as 'near-black'. Images under 256 px are enlarged with nearest-pixel "
-            "sampling, so a test render at the size a game draws the model can be judged."
+            "sampling, so a test render at the size a game draws the model can be judged. "
+            "With crop, shows and measures only part of the image (such as the eyes or one "
+            "glowing part), adding the average colour of its brightest pixels with its hue, "
+            "saturation and value as numbers, which is the colour a glow actually renders at. "
+            "With target, also how far that is from a colour the spec names."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -117,6 +122,24 @@ TOOL_DEFS = [
                 "image": {
                     "type": "string",
                     "description": "Name of an image in bpy.data.images to view.",
+                },
+                "crop": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "[x_min, y_min, x_max, y_max] as fractions 0-1 of the image, origin at "
+                        "the bottom left, x to the right and y up: the coordinates "
+                        "bpy_extras.object_utils.world_to_camera_view returns, so a part's "
+                        "projected corners can be passed directly."
+                    ),
+                },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Hex colour the part should render at (e.g. '#9e47ff' from the spec). "
+                        "Adds how far the brightest pixels are from it in hue, saturation "
+                        "and value. Use with crop."
+                    ),
                 },
             },
             "required": [],
@@ -142,6 +165,10 @@ TOOL_DEFS = [
                     "type": "integer",
                     "description": "Frame whose pose should equal the start frame (e.g. 73 for a 72-frame loop starting at 1).",
                 },
+                "collection": {
+                    "type": "string",
+                    "description": "Check every mesh in this collection and its child collections.",
+                },
                 "objects": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -163,8 +190,8 @@ TOOL_DEFS = [
             "rendered view easily hides. Splits the evaluated meshes into connected pieces, "
             "joins pieces whose surfaces cross or come within a small tolerance, and reports "
             "every group not joined to the main body with its position, size and gap. Pass "
-            "root (or objects) to check one model when the scene holds several. Check at "
-            "several frames if parts move."
+            "root, collection or objects to check one model when the scene holds several. "
+            "Check at several frames if parts move."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -173,6 +200,10 @@ TOOL_DEFS = [
                 "root": {
                     "type": "string",
                     "description": "Check the meshes in this object's hierarchy (it and all its descendants).",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": "Check every mesh in this collection and its child collections (for a model built as separate, unparented parts).",
                 },
                 "objects": {
                     "type": "array",
@@ -216,6 +247,10 @@ TOOL_DEFS = [
                     "type": "string",
                     "description": "Measure the meshes in this object's hierarchy.",
                 },
+                "collection": {
+                    "type": "string",
+                    "description": "Measure every mesh in this collection and its child collections (for a model built as separate, unparented parts).",
+                },
                 "objects": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -255,6 +290,10 @@ TOOL_DEFS = [
                     "type": "string",
                     "description": "Check the meshes in this object's hierarchy.",
                 },
+                "collection": {
+                    "type": "string",
+                    "description": "Check every mesh in this collection and its child collections (for a model built as separate, unparented parts).",
+                },
                 "objects": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -274,7 +313,94 @@ TOOL_DEFS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "render_map_test",
+        "description": (
+            "Render the model as a game draws it on a strategy map: an orthographic view from "
+            "above at the size the spec gives (px_height pixels for the model's height, so "
+            "one pixel is height / px_height), framed so the whole model fits with a margin, "
+            "with the dark outline the game adds, over a dark map colour. Returns the image "
+            "enlarged pixel for pixel and the model's size in pixels. Uses the scene's render "
+            "engine, lights and colour management, hides other objects for the render, and "
+            "restores every scene setting afterwards. Also counts the model's bright, saturated "
+            "pixels by hue (teal, violet and so on), to show which glows still read. With path "
+            "it tests an exported file. Use it whenever a spec says how many pixels tall the "
+            "game draws the model."
+        ),
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "px_height": {
+                    "type": "integer",
+                    "description": "How many pixels tall the spec says the game draws the model (e.g. 30).",
+                },
+                "metres_per_px": {
+                    "type": "number",
+                    "description": "Size of one pixel in metres, when the spec gives it (e.g. 0.07). Default: the model's height / px_height.",
+                },
+                "elevation": {
+                    "type": "number",
+                    "description": "Camera angle above the horizon in degrees (default 55; 90 looks straight down).",
+                },
+                "azimuth": {
+                    "type": "number",
+                    "description": "Camera direction in degrees around the model, 0 = in front (-Y), 90 = on its +X side (default 30).",
+                },
+                "outline_px": {
+                    "type": "integer",
+                    "description": "Outline width in pixels (default 1; 0 for none).",
+                },
+                "background": {
+                    "type": "string",
+                    "description": "Map colour behind the model, as hex (default '#2a2b32').",
+                },
+                "view_transform": {
+                    "type": "string",
+                    "description": (
+                        "Colour management view transform for this render, restored afterwards: "
+                        "the one closest to the game's tonemapper ('Filmic' for Godot's Filmic, "
+                        "'ACES 1.3' for ACES, 'AgX', 'Standard'). Default: the scene's. Glow colours and "
+                        "the glow pixel counts depend on it."
+                    ),
+                },
+                "root": {"type": "string", "description": "Render the meshes in this object's hierarchy."},
+                "collection": {"type": "string", "description": "Render every mesh in this collection."},
+                "objects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Mesh objects to render (default: all visible meshes).",
+                },
+                "frame": {"type": "integer", "description": "Frame to render (default: current)."},
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "An exported .glb or .gltf to test instead of the scene: it is imported "
+                        "for the render, in the pose the file stores, and removed afterwards. "
+                        "Use it to run the map test on the final export."
+                    ),
+                },
+            },
+            "required": ["px_height"],
+            "additionalProperties": False,
+        },
+    },
 ]
+
+
+def _target_error(args, keys=("root", "collection", "objects")):
+    """Error string if the root/collection/objects arguments in keys are malformed."""
+    given = [k for k in keys if args.get(k) is not None]
+    if len(given) > 1:
+        return f"Pass only one of {', '.join(keys)}."
+    for k in ("root", "collection"):
+        v = args.get(k)
+        if k in keys and v is not None and (not isinstance(v, str) or not v):
+            return f"{k} must be a non-empty string."
+    objs = args.get("objects")
+    if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
+        return "objects must be a list of object names."
+    return None
 
 
 def validate(name, args):
@@ -305,27 +431,62 @@ def validate(name, args):
                 return f"{key} must be a non-empty string."
         if args.get("path") and args.get("image"):
             return "Pass either path or image, not both."
+        crop = args.get("crop")
+        if crop is not None:
+            if (not isinstance(crop, list) or len(crop) != 4
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop)):
+                return "crop must be four numbers: [x_min, y_min, x_max, y_max]."
+            x0, y0, x1, y1 = crop
+            if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+                return "crop needs 0 <= x_min < x_max <= 1 and 0 <= y_min < y_max <= 1."
+        tgt = args.get("target")
+        if tgt is not None and (not isinstance(tgt, str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", tgt.strip())):
+            return "target must be a hex colour such as '#9e47ff'."
+    elif name == "render_map_test":
+        px = args.get("px_height")
+        if not isinstance(px, int) or isinstance(px, bool) or not 8 <= px <= 256:
+            return "px_height must be an integer from 8 to 256."
+        err = _target_error(args)
+        if err:
+            return err
+        glb = args.get("path")
+        if glb is not None:
+            if not isinstance(glb, str) or not glb.lower().endswith((".glb", ".gltf")):
+                return "path must be a .glb or .gltf file."
+            clash = [k for k in ("root", "collection", "objects", "frame") if args.get(k) is not None]
+            if clash:
+                return f"path tests the exported file at its stored pose; don't pass {', '.join(clash)} with it."
+        for key, lo, hi in (("elevation", 5, 90), ("azimuth", -180, 360),
+                            ("metres_per_px", 1e-4, 10), ("outline_px", 0, 4)):
+            v = args.get(key)
+            if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool)
+                                  or not lo <= v <= hi):
+                return f"{key} must be a number from {lo:g} to {hi:g}."
+        fr = args.get("frame")
+        if fr is not None and (not isinstance(fr, int) or isinstance(fr, bool)):
+            return "frame must be an integer."
+        bg = args.get("background")
+        if bg is not None and (not isinstance(bg, str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", bg.strip())):
+            return "background must be a hex colour such as '#2a2b32'."
+        vt = args.get("view_transform")
+        if vt is not None and (not isinstance(vt, str) or not vt.strip()):
+            return "view_transform must be a view transform name such as 'Filmic' or 'AgX'."
     elif name == "check_animation_loop":
         s, e = args.get("start"), args.get("end")
         if not isinstance(s, int) or not isinstance(e, int) or isinstance(s, bool) or isinstance(e, bool):
             return "start and end must be integers."
         if e - s < 8:
             return "The loop must be at least 8 frames long (end - start >= 8)."
-        objs = args.get("objects")
-        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
-            return "objects must be a list of object names."
+        err = _target_error(args, ("collection", "objects"))
+        if err:
+            return err
         tr = args.get("nla_track")
         if tr is not None and (not isinstance(tr, str) or not tr):
             return "nla_track must be a non-empty string."
     elif name == "check_detached_parts":
-        if args.get("root") is not None and args.get("objects") is not None:
-            return "Pass either root or objects, not both."
-        r = args.get("root")
-        if r is not None and (not isinstance(r, str) or not r):
-            return "root must be a non-empty string."
-        objs = args.get("objects")
-        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
-            return "objects must be a list of object names."
+        err = _target_error(args)
+        if err:
+            return err
         fr = args.get("frames")
         if fr is not None and (not isinstance(fr, list) or not 1 <= len(fr) <= 8
                                or not all(isinstance(f, int) and not isinstance(f, bool) for f in fr)):
@@ -334,14 +495,9 @@ def validate(name, args):
         if tol is not None and (not isinstance(tol, (int, float)) or isinstance(tol, bool) or tol < 0):
             return "tolerance must be a non-negative number."
     elif name in ("measure_model", "check_ground_contact"):
-        if args.get("root") is not None and args.get("objects") is not None:
-            return "Pass either root or objects, not both."
-        r = args.get("root")
-        if r is not None and (not isinstance(r, str) or not r):
-            return "root must be a non-empty string."
-        objs = args.get("objects")
-        if objs is not None and (not isinstance(objs, list) or not all(isinstance(o, str) and o for o in objs)):
-            return "objects must be a list of object names."
+        err = _target_error(args)
+        if err:
+            return err
         nums = ("height", "ground") if name == "measure_model" else ("ground", "tolerance")
         for key in nums:
             v = args.get(key)
@@ -352,8 +508,8 @@ def validate(name, args):
             if p is not None:
                 if not isinstance(p, str) or not p:
                     return "path must be a non-empty string."
-                if r is not None or objs is not None:
-                    return "Pass either path or root/objects, not both."
+                if any(args.get(k) is not None for k in ("root", "collection", "objects")):
+                    return "Pass either path or root/collection/objects, not both."
             fr = args.get("frame")
             if fr is not None and (not isinstance(fr, int) or isinstance(fr, bool)):
                 return "frame must be an integer."
@@ -797,18 +953,126 @@ def _colour_summary(img):
 SMALL_IMAGE_EDGE = 256
 
 
-def _png_blocks(src, out, caption, stats=False):
+# Teal runs to 205: under Filmic a teal glow drifts toward cyan (about 180-200 deg).
+_HUE_NAMES = ((15, "red"), (45, "orange"), (70, "yellow"), (150, "green"), (205, "teal"),
+              (245, "blue"), (290, "violet"), (330, "magenta"), (345, "pink"), (361, "red"))
+
+
+def _hsv(rgb):
+    """(hue in degrees, saturation 0-1, value 0-1) of an sRGB colour given as 0-1 floats."""
+    import colorsys
+
+    h, s, v = colorsys.rgb_to_hsv(*(min(1.0, max(0.0, float(c))) for c in rgb[:3]))
+    return h * 360.0, s, v
+
+
+def _hue_name(hue, sat):
+    if sat < 0.15:
+        return "grey or white"
+    return next(name for top, name in _HUE_NAMES if hue < top)
+
+
+def _sat_word(sat):
+    # HSV saturation, not channel spread: a bright pale colour has a large spread but low
+    # saturation. Calibrated so pale lavender (#b1a2ef, 32%) reads pale and a glow colour
+    # such as #9e47ff (72%) reads saturated.
+    if sat < 0.15:
+        return "nearly white or grey"
+    if sat < 0.4:
+        return "pale"
+    return "fairly saturated" if sat < 0.65 else "saturated"
+
+
+def _hsv_words(rgb):
+    hue, sat, val = _hsv(rgb)
+    return (f"hue {hue:.0f}deg ({_hue_name(hue, sat)}), saturation {sat * 100:.0f}% "
+            f"({_sat_word(sat)}), value {val * 100:.0f}%")
+
+
+def _parse_hex(text):
+    t = text.strip().lstrip("#")
+    return [int(t[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+
+
+def _bright_summary(img, target=None):
+    """One sentence with the average colour of the brightest tenth of an image's pixels
+    (by HSV value): the hue a glowing part really renders at, which the overall average
+    dilutes. Crop tightly, or pale surfaces next to the glow count too. With target (a hex
+    colour), also how far the brightest pixels are from it."""
+    import numpy as np
+
+    w, h = img.size
+    ch = img.channels
+    if ch < 3:
+        return ""
+    px = np.empty(w * h * ch, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    px = px.reshape(-1, ch)
+    rgb = _srgb(px[:, :3]) if img.is_float else px[:, :3]
+    if ch == 4:
+        rgb = rgb[px[:, 3] > 0.5]
+    if not len(rgb):
+        return ""
+    value = rgb.max(axis=1)  # HSV value: a saturated glow is bright here, unlike luma
+    k = max(1, len(rgb) // 10)
+    top = rgb[np.argsort(value)[-k:]].mean(axis=0)
+    text = f" Brightest tenth of the pixels averages {_hex(top)} (sRGB: {_hsv_words(top)})."
+    if target:
+        goal = _parse_hex(target)
+        h0, s0, v0 = _hsv(top)
+        h1, s1, v1 = _hsv(goal)
+        dh = (h0 - h1 + 180) % 360 - 180
+
+        def diff(d, unit, up, down, same):
+            n = round(abs(d))
+            return same if n == 0 else f"{n}{unit} {up if d > 0 else down}"
+
+        text += (f" Target {_hex(goal)}: {_hsv_words(goal)}. The brightest pixels are "
+                 f"{diff(dh, 'deg', 'higher in hue', 'lower in hue', 'the same hue')}, "
+                 f"{diff((s0 - s1) * 100, ' points', 'more saturated', 'less saturated', 'as saturated')} and "
+                 f"{diff((v0 - v1) * 100, ' points', 'brighter', 'darker', 'as bright')}.")
+    return text
+
+
+def _crop_image(img, crop):
+    """Crop a loaded image in place to crop = [x0, y0, x1, y1] (fractions, origin bottom
+    left, as Blender stores pixels). Returns the crop's pixel box (x, y, w, h)."""
+    import numpy as np
+
+    w, h = img.size
+    ch = img.channels
+    x0, y0, x1, y1 = crop
+    px0, py0 = min(w - 1, int(math.floor(x0 * w))), min(h - 1, int(math.floor(y0 * h)))
+    px1, py1 = max(px0 + 1, int(math.ceil(x1 * w))), max(py0 + 1, int(math.ceil(y1 * h)))
+    px = np.empty(w * h * ch, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    part = px.reshape(h, w, ch)[py0:py1, px0:px1].copy()
+    cw, chh = px1 - px0, py1 - py0
+    img.scale(cw, chh)
+    img.pixels.foreach_set(part.ravel())
+    return px0, py0, cw, chh
+
+
+def _png_blocks(src, out, caption, stats=False, crop=None, target=None):
     """Load the image at src, shrink it to MAX_IMAGE_EDGE (or enlarge a small one with
     nearest-pixel sampling), write it to out as PNG and return it as tool-result blocks.
-    With stats, the caption adds the average colour. src is never modified unless it
-    equals out."""
+    With stats, the caption adds the average colour. With crop ([x0, y0, x1, y1] as
+    fractions, origin bottom left) only that part is shown and measured. src is never
+    modified unless it equals out."""
     img = bpy.data.images.load(src, check_existing=False)
     try:
         w, h = img.size
         if not w or not h:
             raise RuntimeError(f"Could not read image data from {src}.")
+        if crop:
+            fw, fh = w, h
+            cx, cy, w, h = _crop_image(img, crop)
+            caption += (f", cropped to {w}x{h} px at x {cx}-{cx + w}, y {cy}-{cy + h} "
+                        f"(from the bottom left) of {fw}x{fh}")
         black = _mostly_black(img)
         summary = _colour_summary(img) if stats else ""
+        if stats and (crop or target):
+            summary += _bright_summary(img, target)
         longest = max(w, h)
         if longest > MAX_IMAGE_EDGE:
             s = MAX_IMAGE_EDGE / longest
@@ -935,6 +1199,7 @@ def capture_viewport(args):
 
 
 def view_image(args):
+    crop = args.get("crop")
     out = _temp_png("image")
     _remove_file(out)
     path = args.get("path")
@@ -942,7 +1207,8 @@ def view_image(args):
         path = os.path.abspath(bpy.path.abspath(path))
         if not os.path.isfile(path):
             raise RuntimeError(f"No file at {path}.")
-        return _png_blocks(path, out, f"Image file {path}", stats=True)
+        return _png_blocks(path, out, f"Image file {path}", stats=True, crop=crop,
+                       target=args.get("target"))
 
     name = args.get("image") or "Render Result"
     img = bpy.data.images.get(name)
@@ -961,7 +1227,9 @@ def view_image(args):
             img.save_render(src)
         except Exception as e:
             raise RuntimeError(f"Could not read {name!r} (has anything been rendered?): {e}")
-        return _png_blocks(src, out, f"Image {name!r}", stats=True)
+        vt = bpy.context.scene.view_settings.view_transform
+        return _png_blocks(src, out, f"Image {name!r} (shown with view transform {vt})",
+                           stats=True, crop=crop, target=args.get("target"))
 
     # Ordinary image (e.g. a baked texture, possibly packed or never saved): copy its
     # pixels into a temporary image so the original is left untouched.
@@ -987,7 +1255,8 @@ def view_image(args):
         tmp.save()
     finally:
         bpy.data.images.remove(tmp)
-    return _png_blocks(src, out, f"Image {name!r}", stats=True)
+    return _png_blocks(src, out, f"Image {name!r}", stats=True, crop=crop,
+                       target=args.get("target"))
 
 
 def _world_points(ev):
@@ -1069,7 +1338,8 @@ def _stalled_channels(o, start, end):
         near = (abs(v[start + 3] - v[start + 2]) + abs(v[end - 2] - v[end - 3])) / 2
         through = (v[end] - v[end - 2]) * (v[start + 2] - v[start]) > 0
         if through and near > 1e-6 and seam < 0.4 * near:
-            found.append(f"{fc.data_path}[{fc.array_index}]")
+            cyc = any(m.type == "CYCLES" and not m.mute for m in fc.modifiers)
+            found.append((f"{fc.data_path}[{fc.array_index}]", cyc))
     return found
 
 
@@ -1091,10 +1361,14 @@ def check_animation_loop(args):
     mid = (start + end) // 2
     track = args.get("nla_track")
     names = args.get("objects")
-    if names:
+    if args.get("collection"):
+        objs = _named_meshes({"collection": args["collection"]})
+    elif names:
         missing = [n for n in names if n not in bpy.data.objects]
         if missing:
-            raise RuntimeError(f"No object named: {', '.join(missing)}.")
+            raise RuntimeError(
+                f"No object named: {', '.join(missing)}. Pass collection to check every mesh "
+                "in a collection, or leave out objects to use every visible mesh.")
         objs = [bpy.data.objects[n] for n in names]
     else:
         objs = [o for o in bpy.context.view_layer.objects
@@ -1122,9 +1396,13 @@ def check_animation_loop(args):
             for t, m in saved_mutes:
                 t.mute = m
             raise RuntimeError(f"No NLA track named {track!r} on any object.")
+        _nla_refresh(t for t, _ in saved_mutes)
 
     frames = sorted({start, start + 1, start + 2, start + 3, mid, end - 3, end - 2, end - 1, end}
                     | {start + (end - start) * k // 8 for k in range(1, 8)})
+    # Frames whose deformed shape is compared: a skinned cycle such as a breath can be back
+    # at its start pose exactly halfway, so the quarters are checked too.
+    shape_frames = {start, start + (end - start) // 4, mid, start + 3 * (end - start) // 4, end}
     mats = {o.name: {} for o in objs}
     scales = {o.name: {} for o in objs}  # the object's own animated scale
     centres = {}  # middle of the object's geometry, in its local space
@@ -1145,11 +1423,12 @@ def check_animation_loop(args):
                 scales[o.name][f] = ev.matrix_basis.to_scale()
                 if f == start:
                     centres[o.name] = sum((Vector(c) for c in ev.bound_box), Vector()) / 8
-                if f in (start, mid, end):
+                if f in shape_frames:
                     pts[(o.name, f)] = _world_points(ev)
     finally:
         for t, m in saved_mutes:
             t.mute = m
+        _nla_refresh(t for t, _ in saved_mutes)
         scene.frame_set(orig[0], subframe=orig[1])
 
     head = f"Loop check, frame {end} against frame {start}"
@@ -1165,10 +1444,12 @@ def check_animation_loop(args):
         tiny = max(1e-7, diag * 1e-4)
         M = mats[n]
         moved = any(abs(x) > 1e-7 for f in frames for ra, rb in zip(M[f], M[start]) for x in ra - rb)
-        if not moved and len(pm) == len(p0):
-            moved = any((a - b).length > tiny for a, b in zip(pm, p0))
-        if not moved and len(p1) == len(p0):
-            moved = any((a - b).length > tiny for a, b in zip(p1, p0))
+        for f in sorted(shape_frames - {start}):
+            pf = pts[(n, f)]
+            if moved:
+                break
+            if len(pf) == len(p0):
+                moved = any((a - b).length > tiny for a, b in zip(pf, p0))
         if not moved:
             static.append(n)
             continue
@@ -1217,12 +1498,18 @@ def check_animation_loop(args):
         # keeps going the same way through the loop point but nearly stops there.
         src = [(a.name, stalls[a.name]) for a in _with_ancestors([o]) if a.name in stalls]
         if src:
-            which = "; ".join(f"{a} {', '.join(ch)}" for a, ch in src)
+            which = "; ".join(f"{a} {', '.join(c for c, _ in ch)}" for a, ch in src)
+            if all(cyc for _, ch in src for _, cyc in ch):
+                fix = ("Those F-curves already have a Cycles modifier, so the handles are not the "
+                       "cause: the keyed values themselves flatten or kink at the loop point. Move "
+                       "the loop point to where everything moves steadily (for a generated cycle, "
+                       "shift its phase, say by a quarter), or smooth the keys around it.")
+            else:
+                fix = ("Usually flat handles on the end keys: give those F-curves a Cycles "
+                       "modifier so the handles wrap around the loop.")
             problems.append(
                 f"STALL: moved by channels that slow almost to a stop at the loop point while "
-                f"still moving the same way ({which}), so it pauses at every loop. Usually "
-                "flat handles on the end keys: give those F-curves a Cycles modifier so the "
-                "handles wrap around the loop.")
+                f"still moving the same way ({which}), so it pauses at every loop. {fix}")
 
         # Scaling around an origin far from the geometry also slides the geometry.
         c, s0 = centres[n], scales[n][start]
@@ -1425,18 +1712,8 @@ def _detached_at_frame(objs, tol):
 
 
 def check_detached_parts(args):
-    root, names = args.get("root"), args.get("objects")
-    if root:
-        if root not in bpy.data.objects:
-            raise RuntimeError(f"No object named {root!r}.")
-        r = bpy.data.objects[root]
-        objs = [o for o in [r, *r.children_recursive] if o.type == "MESH"]
-    elif names:
-        missing = [n for n in names if n not in bpy.data.objects]
-        if missing:
-            raise RuntimeError(f"No object named: {', '.join(missing)}.")
-        objs = [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
-    else:
+    objs = _named_meshes(args)
+    if objs is None:
         objs = [o for o in bpy.context.view_layer.objects
                 if o is not None and o.type == "MESH" and o.visible_get()]
     if not objs:
@@ -1485,21 +1762,42 @@ def check_detached_parts(args):
 # ---------------------------------------------------------------------------
 
 
-def _target_meshes(args, include_hidden=False):
-    """Visible mesh objects named by args root/objects (or all visible meshes), and how
-    many hidden ones were left out. include_hidden keeps hidden ones (for a reference)."""
-    root, names = args.get("root"), args.get("objects")
+_TARGET_HINT = (
+    " To check a model built as separate parts, pass collection (the collection's name) or "
+    "root (an object whose hierarchy holds them); leave out root, collection and objects to "
+    "use every visible mesh."
+)
+
+
+def _named_meshes(args):
+    """Mesh objects named by args root, collection or objects (hidden ones included), or
+    None when none of them is given."""
+    root, coll, names = args.get("root"), args.get("collection"), args.get("objects")
     if root:
         if root not in bpy.data.objects:
-            raise RuntimeError(f"No object named {root!r}.")
+            raise RuntimeError(f"No object named {root!r}." + _TARGET_HINT)
         r = bpy.data.objects[root]
-        objs = [o for o in [r, *r.children_recursive] if o.type == "MESH"]
-    elif names:
+        return [o for o in [r, *r.children_recursive] if o.type == "MESH"]
+    if coll:
+        scene = bpy.context.scene
+        c = scene.collection if coll == scene.collection.name else bpy.data.collections.get(coll)
+        if c is None:
+            known = ", ".join(repr(x.name) for x in list(bpy.data.collections)[:20])
+            raise RuntimeError(f"No collection named {coll!r}. Collections: {known or 'none'}.")
+        return [o for o in c.all_objects if o.type == "MESH"]
+    if names:
         missing = [n for n in names if n not in bpy.data.objects]
         if missing:
-            raise RuntimeError(f"No object named: {', '.join(missing)}.")
-        objs = [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
-    else:
+            raise RuntimeError(f"No object named: {', '.join(missing)}." + _TARGET_HINT)
+        return [bpy.data.objects[n] for n in names if bpy.data.objects[n].type == "MESH"]
+    return None
+
+
+def _target_meshes(args, include_hidden=False):
+    """Visible mesh objects named by args root/collection/objects (or all visible meshes),
+    and how many hidden ones were left out. include_hidden keeps hidden ones (for a reference)."""
+    objs = _named_meshes(args)
+    if objs is None:
         objs = [o for o in bpy.context.view_layer.objects if o is not None and o.type == "MESH"]
     shown = objs if include_hidden else [o for o in objs if o.visible_get()]
     if not shown:
@@ -1643,6 +1941,54 @@ def _ranges(frames):
     return ", ".join(out)
 
 
+def _offset_words(x, y):
+    """'37.6 cm behind (+Y) and 2.0 cm to its left (+X)' for an X/Y offset from the origin
+    of a model that faces -Y (its left is +X)."""
+    out = []
+    if abs(y) >= 0.005:
+        out.append(f"{_len(abs(y))} {'behind' if y > 0 else 'in front of'} the origin "
+                   f"({'+' if y > 0 else '-'}Y)")
+    if abs(x) >= 0.005:
+        out.append(f"{_len(abs(x))} to the model's {'left' if x > 0 else 'right'} "
+                   f"({'+' if x > 0 else '-'}X)")
+    return " and ".join(out) or "on the origin"
+
+
+def _centre_lines(P, lo, hi):
+    """Lines flagging a model whose bounding box, or the points it stands on, are off the
+    origin in X/Y (a game places a unit by its origin)."""
+    size = hi - lo
+    side = float(max(size[0], size[1]))
+    H = float(size[2])
+    if side <= 1e-6:
+        return []
+    limit = max(0.01, 0.05 * side)
+    cx, cy = float(lo[0] + hi[0]) / 2, float(lo[1] + hi[1]) / 2
+    contact = P[P[:, 2] <= lo[2] + max(0.005, 0.005 * H)]
+    fx = fy = None
+    if len(contact) > 1:
+        clo, chi = contact.min(axis=0), contact.max(axis=0)
+        fx, fy = float(clo[0] + chi[0]) / 2, float(clo[1] + chi[1]) / 2
+    off_box = math.hypot(cx, cy) > limit
+    off_feet = fx is not None and math.hypot(fx, fy) > limit
+    if not off_box and not off_feet:
+        return ["Centred: the bounding box and the points it stands on are within "
+                f"{_len(limit)} of the origin in X and Y."]
+    lines = []
+    if off_box:
+        lines.append(f"NOT CENTRED: the bounding-box centre is {_offset_words(cx, cy)}.")
+    else:
+        lines.append(f"The bounding box is centred (within {_len(limit)}).")
+    if fx is not None:
+        lines.append(f"The points it stands on (its lowest {_len(max(0.005, 0.005 * H))}) "
+                     f"have their centre {_offset_words(fx, fy)}.")
+    lines.append(
+        "A game places a unit by its origin, so if the spec asks for the model centred, "
+        "move it (the root object or armature, not mesh data inside an animated hierarchy) "
+        "and say whether you centred the bounding box or the footprint.")
+    return lines
+
+
 def _describe_extent(P, labels, height, ground, faces=None, stats=None):
     """Report lines for an n x 3 array of world points (Blender axes, Z up, front -Y).
     labels[i] names the part point i belongs to; faces index into P. If stats
@@ -1664,6 +2010,7 @@ def _describe_extent(P, labels, height, ground, faces=None, stats=None):
         f"Bounding-box centre: ({(lo[0] + hi[0]) / 2:.3f}, {(lo[1] + hi[1]) / 2:.3f}, "
         f"{(lo[2] + hi[2]) / 2:.3f}).",
     ]
+    lines += _centre_lines(P, lo, hi)
     gap = float(lo[2]) - ground
     if abs(gap) <= max(1e-4, H * 1e-3):
         lines.append(f"Lowest point is on the ground (z = {ground:g}).")
@@ -2012,7 +2359,7 @@ def measure_model(args):
     path, ref = args.get("path"), args.get("reference")
     mine, theirs = {}, {}
     if path:
-        path = bpy.path.abspath(path)
+        path = os.path.abspath(bpy.path.abspath(path))
         if not os.path.isfile(path):
             raise RuntimeError(f"No file at {path}.")
         text = _measure_gltf(path, args.get("height"), mine)
@@ -2035,6 +2382,24 @@ def measure_model(args):
     return "\n".join([text] + _compare_lines(mine, theirs, rname))
 
 
+def _nla_refresh(tracks):
+    """Make the depsgraph notice NLA mute changes made from Python. Setting NlaTrack.mute
+    doesn't rebuild its relations (Blender 5.2), so a track that was muted when they were
+    built holds its frame-0 pose on every frame once unmuted. Adding and removing a track
+    on the same object does rebuild them."""
+    seen = set()
+    for t in tracks:
+        ob = t.id_data
+        ad = getattr(ob, "animation_data", None)
+        if ad is None or ob in seen:
+            continue
+        seen.add(ob)
+        try:
+            ad.nla_tracks.remove(ad.nla_tracks.new())
+        except RuntimeError:
+            pass  # for example in tweak mode
+
+
 def _solo_nla(track, drivers):
     """Mute every NLA track not named track. Returns (saved mute states, notes)."""
     saved, notes, found = [], [], False
@@ -2053,6 +2418,7 @@ def _solo_nla(track, drivers):
         for t, m in saved:
             t.mute = m
         raise RuntimeError(f"No NLA track named {track!r} on any object.")
+    _nla_refresh(t for t, _ in saved)
     return saved, notes
 
 
@@ -2077,9 +2443,12 @@ def check_ground_contact(args):
     finally:
         for t, m in saved:
             t.mute = m
+        _nla_refresh(t for t, _ in saved)
         scene.frame_set(orig[0], subframe=orig[1])
 
     P0 = data[0]
+    frozen = len(data) > 1 and all(
+        len(p) == len(P0) and float(np.abs(p - P0).max()) < 1e-6 for p in data[1:])
     H = float(P0[:, 2].max() - P0[:, 2].min())
     tol = float(args["tolerance"]) if args.get("tolerance") is not None else max(0.005, 0.005 * H)
     low = np.array([float(p[:, 2].min()) for p in data]) - ground
@@ -2094,6 +2463,11 @@ def check_ground_contact(args):
     lines.append("Lowest point by frame: " + ", ".join(
         f"{f}: {'+' if low[f - start] >= 0 else '-'}{_len(abs(low[f - start]))}" for f in sample))
 
+    if frozen:
+        lines.append(
+            "- NOT MOVING: the model is identical at every frame, so no animation played in "
+            "this range and this is not a check of the clip. Check the track name, that the "
+            "clip sits on these frames, and that the action or track is the one playing.")
     sink = [f for f in frames if low[f - start] < -tol]
     hover = [f for f in frames if low[f - start] > tol]
     if sink:
@@ -2125,7 +2499,9 @@ def check_ground_contact(args):
             sp = np.array(speeds)
             mv = np.mean(vecs, axis=0)
             med = float(np.median(sp))
-            if med < tol * fps * 0.5:
+            if frozen:
+                pass
+            elif med < tol * fps * 0.5:
                 lines.append("- Points on the ground stay put while touching it (no sliding).")
             else:
                 dirn = "backward (+Y)" if mv[1] > abs(mv[0]) else "forward (-Y)" if -mv[1] > abs(mv[0]) else "sideways"
@@ -2155,6 +2531,310 @@ def check_ground_contact(args):
     return "\n".join(lines)
 
 
+MAP_MARGIN_PX = 3  # empty pixels around the model in a map test
+
+# Every kind of datablock the glTF importer can create (a multi-scene file adds scenes,
+# POINTS primitives add point clouds). Kinds this Blender lacks are skipped when the tool
+# runs (bpy.data is restricted while the add-on loads, so not here).
+_IMPORT_KINDS = ("objects", "meshes", "materials", "images", "armatures", "actions",
+                 "collections", "textures", "node_groups", "cameras", "lights", "curves",
+                 "scenes", "pointclouds", "worlds")
+
+
+def _import_gltf_temp(path):
+    """Import a .glb/.gltf into the open scene, posed as the file stores it (its node
+    transforms, which a game shows before any clip plays). Returns (mesh objects, undo):
+    call undo() to remove everything the import added and restore what it changed."""
+    scene = bpy.context.scene
+    vl = bpy.context.view_layer
+    before = {k: set(getattr(bpy.data, k)) for k in _IMPORT_KINDS if hasattr(bpy.data, k)}
+    saved = (scene.frame_start, scene.frame_end, scene.frame_current, scene.render.fps,
+             scene.render.fps_base, vl.active_layer_collection, vl.objects.active,
+             [o for o in vl.objects if o.select_get()])
+
+    def undo():
+        for k in before:
+            coll = getattr(bpy.data, k)
+            new = [x for x in coll if x not in before[k]]
+            if new:
+                bpy.data.batch_remove(new)
+        (scene.frame_start, scene.frame_end, frame, scene.render.fps,
+         scene.render.fps_base, alc, act, sel) = saved
+        with contextlib.suppress(Exception):
+            vl.active_layer_collection = alc
+        for o in vl.objects:
+            o.select_set(o in sel)
+        vl.objects.active = act
+        scene.frame_set(frame)
+
+    try:
+        # The importer links into the active collection, which may be excluded or hidden
+        # from renders; import into the scene's root collection instead (undo restores it).
+        vl.active_layer_collection = vl.layer_collection
+        # Bones built from the node transforms (not the inverse bind matrices), so a pose
+        # reset to identity shows the file's own pose.
+        # disable_bone_shape: otherwise the importer adds an icosphere mesh for bone display.
+        bpy.ops.import_scene.gltf(filepath=path, guess_original_bind_pose=False,
+                                  disable_bone_shape=True, import_select_created_objects=False)
+        new_objs = [o for o in bpy.data.objects
+                    if o not in before["objects"] and o.name in scene.objects]
+        for o in new_objs:
+            if o.animation_data:
+                o.animation_data_clear()
+            keys = getattr(o.data, "shape_keys", None)
+            if keys and keys.animation_data:
+                # Morph-target clips animate the shape keys, not the object.
+                keys.animation_data_clear()
+            if o.type == "ARMATURE":
+                for pb in o.pose.bones:
+                    pb.matrix_basis.identity()
+        vl.update()
+        meshes = [o for o in new_objs if o.type == "MESH"]
+        if not meshes:
+            raise RuntimeError(f"{os.path.basename(path)} has no meshes.")
+        hidden = [o.name for o in meshes if o.name not in vl.objects or o.hide_render]
+        if hidden:
+            raise RuntimeError(f"Imported meshes are hidden from renders: {', '.join(hidden[:5])}.")
+        return meshes, undo
+    except Exception:
+        undo()
+        raise
+
+
+def _dilate(mask, steps):
+    """Grow a 2-D boolean mask by steps pixels (8-connected)."""
+    import numpy as np
+
+    out = mask.copy()
+    for _ in range(steps):
+        p = np.pad(out, 1)
+        grown = np.zeros_like(out)
+        for dy in (0, 1, 2):
+            for dx in (0, 1, 2):
+                grown |= p[dy:dy + out.shape[0], dx:dx + out.shape[1]]
+        out = grown
+    return out
+
+
+def render_map_test(args):
+    glb = args.get("path")
+    undo_import = None
+    if glb:
+        glb = os.path.abspath(bpy.path.abspath(glb))
+        if not os.path.isfile(glb):
+            raise RuntimeError(f"No file at {glb}.")
+        objs, undo_import = _import_gltf_temp(glb)
+    else:
+        objs, _ = _target_meshes(args)
+    try:
+        return _map_test(args, objs, glb)
+    finally:
+        if undo_import:
+            undo_import()
+
+
+def _map_test(args, objs, glb):
+    import numpy as np
+    from mathutils import Matrix, Vector
+
+    scene = bpy.context.scene
+    rd = scene.render
+    px_h = int(args["px_height"])
+    el = math.radians(float(args.get("elevation", 55)))
+    az = math.radians(float(args.get("azimuth", 30)))
+    outline = int(args.get("outline_px", 1))
+    bg_hex = (args.get("background") or "#2a2b32").lstrip("#")
+    bg = np.array([int(bg_hex[i:i + 2], 16) / 255 for i in (0, 2, 4)], dtype=np.float32)
+    ink = np.array([0.04, 0.04, 0.05], dtype=np.float32)  # the outline colour
+
+    orig_frame = (scene.frame_current, scene.frame_subframe)
+    saved = {
+        "camera": scene.camera, "res": (rd.resolution_x, rd.resolution_y, rd.resolution_percentage),
+        "film": rd.film_transparent, "fmt": (rd.image_settings.file_format, rd.image_settings.color_mode),
+        "border": rd.use_border, "pixel_aspect": (rd.pixel_aspect_x, rd.pixel_aspect_y),
+        "view": (scene.view_settings.view_transform, scene.view_settings.look),
+    }
+    hidden = []  # objects whose hide_render this call switched on
+    temp = []  # (object, data) created here
+    path = _temp_png("maptest_raw")
+    out = _temp_png("maptest")
+    for p in (path, out):
+        _remove_file(p)
+    try:
+        vt = args.get("view_transform")
+        if vt:
+            try:
+                scene.view_settings.view_transform = vt
+            except TypeError as e:  # not one of this Blender's view transforms
+                raise RuntimeError(f"Unknown view_transform {vt!r}: {e}")
+        if args.get("frame") is not None:
+            scene.frame_set(int(args["frame"]))
+        dg = bpy.context.evaluated_depsgraph_get()
+        P = np.concatenate([_eval_mesh(o.evaluated_get(dg))[0] for o in objs])
+        if not len(P):
+            raise RuntimeError("The meshes have no vertices.")
+        lo, hi = P.min(axis=0), P.max(axis=0)
+        H = float(hi[2] - lo[2])
+        if H <= 1e-6:
+            raise RuntimeError("The model has no height.")
+        mpp = float(args.get("metres_per_px") or H / px_h)
+
+        # Orthographic camera looking at the model from (azimuth, elevation).
+        d = Vector((math.sin(az) * math.cos(el), -math.cos(az) * math.cos(el), math.sin(el)))
+        centre = Vector(((lo + hi) / 2).tolist())
+        dist = float(np.linalg.norm(hi - lo)) * 2 + 10
+        rot = (-d).to_track_quat("-Z", "Y").to_matrix()
+        cam_pos = centre + d * dist
+        # Camera-space x/y of every point, to frame the model exactly.
+        R = np.array(rot, dtype=np.float64)
+        Q = (P - np.array(cam_pos)) @ R  # columns: camera x, y, -depth
+        x0, x1 = float(Q[:, 0].min()), float(Q[:, 0].max())
+        y0, y1 = float(Q[:, 1].min()), float(Q[:, 1].max())
+        W = int(math.ceil((x1 - x0) / mpp)) + 2 * MAP_MARGIN_PX
+        Ht = int(math.ceil((y1 - y0) / mpp)) + 2 * MAP_MARGIN_PX
+        if max(W, Ht) > 1024:
+            raise RuntimeError(f"The test would be {W}x{Ht} px; pass a smaller px_height "
+                               "or a larger metres_per_px.")
+        cam_pos = cam_pos + rot @ Vector(((x0 + x1) / 2, (y0 + y1) / 2, 0))
+        cd = bpy.data.cameras.new("claude_map_test_cam")
+        cd.type = "ORTHO"
+        cd.ortho_scale = max(W, Ht) * mpp
+        cd.sensor_fit = "AUTO"
+        cd.clip_start = 0.01
+        cd.clip_end = dist * 3
+        cam = bpy.data.objects.new("claude_map_test_cam", cd)
+        temp.append((cam, cd))
+        scene.collection.objects.link(cam)
+        cam.matrix_world = Matrix.Translation(cam_pos) @ rot.to_4x4()
+
+        # A sun if the scene has no light that renders, so the test isn't black.
+        if not any(o.type == "LIGHT" and not o.hide_render for o in scene.objects):
+            ld = bpy.data.lights.new("claude_map_test_sun", "SUN")
+            ld.energy = 3.0
+            sun = bpy.data.objects.new("claude_map_test_sun", ld)
+            temp.append((sun, ld))
+            scene.collection.objects.link(sun)
+            sun.rotation_euler = (math.radians(40), 0, math.radians(30))
+
+        keep = set(objs) | {t[0] for t in temp}
+        for o in scene.objects:
+            if o not in keep and o.type not in {"LIGHT", "CAMERA", "ARMATURE", "EMPTY"} and not o.hide_render:
+                o.hide_render = True
+                hidden.append(o)
+
+        scene.camera = cam
+        rd.resolution_x, rd.resolution_y, rd.resolution_percentage = W, Ht, 100
+        rd.pixel_aspect_x = rd.pixel_aspect_y = 1
+        rd.use_border = False
+        rd.film_transparent = True
+        rd.image_settings.file_format = "PNG"
+        rd.image_settings.color_mode = "RGBA"
+        bpy.ops.render.render(write_still=False)
+        bpy.data.images["Render Result"].save_render(path)
+    finally:
+        scene.camera = saved["camera"]
+        rd.resolution_x, rd.resolution_y, rd.resolution_percentage = saved["res"]
+        rd.film_transparent = saved["film"]
+        rd.image_settings.file_format, rd.image_settings.color_mode = saved["fmt"]
+        rd.use_border = saved["border"]
+        rd.pixel_aspect_x, rd.pixel_aspect_y = saved["pixel_aspect"]
+        view_used = scene.view_settings.view_transform
+        if (scene.view_settings.view_transform, scene.view_settings.look) != saved["view"]:
+            scene.view_settings.view_transform = saved["view"][0]
+            with contextlib.suppress(TypeError):
+                scene.view_settings.look = saved["view"][1]
+        for o in hidden:
+            o.hide_render = False
+        for o, data in temp:
+            bpy.data.objects.remove(o)
+            if isinstance(data, bpy.types.Camera):
+                bpy.data.cameras.remove(data)
+            else:
+                bpy.data.lights.remove(data)
+        scene.frame_set(orig_frame[0], subframe=orig_frame[1])
+
+    if not os.path.isfile(path):
+        raise RuntimeError("The render wrote no image.")
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        w, h = img.size
+        ch = img.channels
+        px = np.empty(w * h * ch, dtype=np.float32)
+        img.pixels.foreach_get(px)
+        px = px.reshape(h, w, ch)
+        rgb = px[:, :, :3]
+        a = px[:, :, 3] if ch == 4 else np.ones((h, w), dtype=np.float32)
+        solid = a > 0.5
+        under = np.broadcast_to(bg, rgb.shape).copy()
+        if outline:
+            ring = _dilate(solid, outline) & ~solid
+            under[ring] = ink
+        comp = rgb * a[..., None] + under * (1 - a[..., None])
+        flat = np.concatenate([comp, np.ones((h, w, 1), dtype=np.float32)], axis=2)
+        res = bpy.data.images.new("claude_map_test", w, h, alpha=True)
+        try:
+            res.colorspace_settings.name = img.colorspace_settings.name
+            res.pixels.foreach_set(flat.ravel())
+            res.filepath_raw = out
+            res.file_format = "PNG"
+            res.save()
+        finally:
+            bpy.data.images.remove(res)
+    finally:
+        bpy.data.images.remove(img)
+    _remove_file(path)
+
+    glow = _glow_pixels(comp, solid)
+    ys, xs = np.nonzero(solid)
+    if len(xs):
+        sw, sh = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+        size = f"The model covers {sw} x {sh} px (wide x tall) of the {w}x{h} image"
+    else:
+        size = "Nothing rendered: the model is not visible from this camera"
+    note = (f"Map test: 1 px = {_len(mpp)} (model height {_len(H)} / "
+            f"{'metres_per_px' if args.get('metres_per_px') else str(px_h) + ' px'}), "
+            f"orthographic, {math.degrees(el):g} deg above the horizon, azimuth "
+            f"{math.degrees(az):g} deg (0 = front), "
+            + (f"{outline} px dark outline" if outline else "no outline")
+            + f", {MAP_MARGIN_PX} px margin, view transform {view_used}"
+            + ("" if args.get("view_transform") else " (the scene's; pass view_transform to "
+               "match the game's tonemapper)")
+            + f". {size}. In a view from above the model looks "
+            "taller in pixels than px_height, because its depth shows too.")
+    if glb:
+        note = (f"{os.path.basename(glb)}, in the pose the file stores (no clip playing). "
+                + note)
+    note += " " + glow
+    blocks = _png_blocks(out, out, "Map test render", stats=True)
+    blocks[-1]["text"] = note + " " + blocks[-1]["text"]
+    return blocks
+
+
+def _glow_pixels(comp, solid):
+    """One sentence counting the model's bright, saturated pixels in a map test by hue, so
+    'the glowing lines read' has a number behind it. comp is h x w x 3 sRGB 0-1."""
+    import numpy as np
+
+    rgb = comp[solid]
+    if not len(rgb):
+        return ""
+    mx, mn = rgb.max(axis=1), rgb.min(axis=1)
+    sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
+    bright = (mx >= 0.6) & (sat >= 0.4)
+    if not bright.any():
+        return ("Bright, saturated pixels (glows, or brightly painted parts): none, so no "
+                "glow reads at this size.")
+    counts = {}
+    for c in rgb[bright]:
+        hue, s_, _ = _hsv(c)
+        name = _hue_name(hue, s_)
+        counts[name] = counts.get(name, 0) + 1
+    parts = ", ".join(f"{n} {name}" for name, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+    return (f"Bright, saturated pixels (value 60%+, saturation 40%+: glows, or brightly "
+            f"painted parts) by hue: {parts}, of {len(rgb)} model pixels. A glow with no "
+            "pixels here, or only one or two, doesn't read at this size.")
+
+
 HANDLERS = {
     "get_scene_summary": get_scene_summary,
     "get_object_details": get_object_details,
@@ -2165,6 +2845,7 @@ HANDLERS = {
     "check_detached_parts": check_detached_parts,
     "measure_model": measure_model,
     "check_ground_contact": check_ground_contact,
+    "render_map_test": render_map_test,
 }
 
 
