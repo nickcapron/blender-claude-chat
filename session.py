@@ -112,7 +112,9 @@ dark paint toward grey whatever its albedo, so darkening the bake to pull that a
 down only crushes the painted shading, panels and edge wear. If the project has finished \
 models in the same style and a command that renders models in the game's renderer, render \
 yours beside one or two of them in the same image (such commands often take several files) \
-and compare how dark the hulls look there. Texture lightness alone doesn't predict it: \
+and compare how dark the hulls look there: view_image with a crop of the same kind of \
+hull panel on each model, not the averages of whole renders, which mix in glows, \
+citadels and background. Texture lightness alone doesn't predict it: \
 dark trim, crevices and the size of the panels change how dark a hull reads, so two \
 textures with the same median lightness can look near-black on one model and mid-grey on \
 another. Say which models you compared with.
@@ -184,7 +186,14 @@ out, say which and why in the final report.
 - When you import a reference model, put it in its own collection and prefix its objects, \
 meshes and materials with REF_ straight away. Otherwise your new parts with the same names \
 get .001 suffixes, and looking an object up by name can find (and change or delete) the \
-reference instead of your part.
+reference instead of your part. The glTF importer puts what it imports in a collection of \
+its own ('Import Scene as Collection' is on by default), wherever you set the active \
+collection: pass import_scene_as_collection=False, or move the new objects (the set of \
+objects that weren't there before the import) into your REF_ collection, and hide or \
+delete the reference by that set or the REF_ prefix. Before a preview render or a bake, \
+print the meshes that will render (not hide_render, in a collection that isn't excluded) \
+and check that only your model's are there: a hidden reference left inside the model \
+shows up as stray dark shapes in renders and as shading in the bake.
 - When a spec asks you to match a reference's size or outline, compare your build with it \
 (measure_model with reference=...) on the first blockout and again before export, and fix \
 differences in width, depth, main-body height and squatness rather than only reporting them. \
@@ -255,6 +264,11 @@ sink into it, with the body lowest just after a foot lands and highest as the le
 check_ground_contact shows this. In a cycle made in place, the planted foot should move \
 back at a steady speed; tell the user that speed, since the game must move the unit at it \
 for the feet not to slide.
+- A bob or other back-and-forth movement given as one distance ('bobs 0.05 m') is the \
+whole travel, from lowest to highest (±0.025 m), unless the spec writes ± or 'each way'. \
+A swing given as an angle ('sways 2 degrees', 'pitches 2 degrees nose up and down') is \
+that far each way (±2 degrees). A held pose ('tipped 5 degrees down') is a fixed offset. \
+Say in your final reply which reading you used.
 - For a looping clip, give the F-curves a Cycles modifier so auto handles wrap around the \
 loop; otherwise the first and last keys get flat handles and the motion pauses at the seam.
 - The glTF exporter keeps scene frame times, so a clip on frames 1 to 193 exports as \
