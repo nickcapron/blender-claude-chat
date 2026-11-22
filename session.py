@@ -105,7 +105,13 @@ model fits inside the frame with a margin (check with \
 bpy_extras.object_utils.world_to_camera_view on the bounding-box corners).
 - Check colour words in a spec ('near-black', a hex colour) in the render, using the \
 average colour view_image reports. If the colour is off, change the material or bake setup \
-and bake again rather than scaling the baked pixels.
+and bake again rather than scaling the baked pixels. Judge a painted colour on the painted \
+surface itself: view_image on the baked texture, or a crop of the render that holds only \
+hull. A whole-model average includes the glows, and a game renderer's ambient light lifts \
+dark paint toward grey whatever its albedo, so darkening the bake to pull that average \
+down only crushes the painted shading, panels and edge wear. If the project has textures \
+for models in the same style (such as *_basecolor.png next to its other models), compare \
+your texture's lightness with theirs, and keep it close unless the spec says otherwise.
 - When a spec says how many pixels tall or wide a game draws the model, run \
 render_map_test with that size (and metres_per_px if the spec gives a pixel size) rather \
 than setting up a camera yourself, and check that the outline and any glowing lines still \
@@ -261,7 +267,11 @@ and no active action. Pass export_optimize_animation_size=False and \
 export_optimize_animation_keep_anim_object=True (both are needed) so every clip keys every \
 node any clip animates. Otherwise a channel that stays constant in one clip (a turret held \
 forward in walk) is left out, and the game keeps the value the previous clip left. \
-measure_model with path reports channels some clips key and others don't.
+These options don't cover material channels (an emission strength exported through \
+KHR_animation_pointer): the exporter still drops one that stays constant in a clip. Give it \
+a change too small to see (a 0.5% breath across the clip) so every clip keys it. \
+measure_model with path reports channels some clips key and others don't, material \
+channels included.
 
 Finishing a task:
 - When the task comes from a written spec or checklist, go back through it item by item \

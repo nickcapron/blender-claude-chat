@@ -2312,21 +2312,47 @@ def _clip_gaps(js, anims, names):
     sweeps in idle stays turned in walk."""
     if len(anims) < 2:
         return []
+    import re
+
     nodes = js.get("nodes", [])
-    keyed = [{(c["target"]["node"], c["target"].get("path", "?")) for c in a.get("channels", [])
-              if "node" in c.get("target", {})} for a in anims]
+    materials = js.get("materials", [])
+
+    def channel_key(target):
+        if "node" in target:
+            return ("node", target["node"], target.get("path", "?"))
+        ptr = target.get("extensions", {}).get("KHR_animation_pointer", {}).get("pointer")
+        return ("pointer", ptr, "") if ptr else None
+
+    def describe(key):
+        kind, ref, path = key
+        if kind == "node":
+            name = nodes[ref].get("name", f"node {ref}") if ref < len(nodes) else ref
+            return f"{name} {path}"
+        m = re.match(r"/materials/(\d+)/(.*)", ref)
+        if m and int(m.group(1)) < len(materials):
+            return f"material {materials[int(m.group(1))].get('name', m.group(1))} {m.group(2)}"
+        return ref
+
+    keyed = [{k for c in a.get("channels", []) if (k := channel_key(c.get("target", {})))}
+             for a in anims]
     every = set().union(*keyed)
     out = []
     for name, k in zip(names, keyed):
-        miss = sorted(every - k)
+        miss = sorted(every - k, key=lambda x: (x[0], str(x[1]), x[2]))
         if not miss:
             continue
-        desc = ", ".join(f"{nodes[n].get('name', f'node {n}') if n < len(nodes) else n} {path}"
-                         for n, path in miss[:6]) + (" ..." if len(miss) > 6 else "")
+        desc = ", ".join(describe(x) for x in miss[:6]) + (" ..." if len(miss) > 6 else "")
+        fixes = []
+        if any(x[0] == "node" for x in miss):
+            fixes.append("for objects, export with export_optimize_animation_size=False and "
+                         "export_optimize_animation_keep_anim_object=True")
+        if any(x[0] == "pointer" for x in miss):
+            fixes.append("for material channels, which the exporter drops when they stay "
+                         "constant whatever the options, key a change too small to see "
+                         "(a 0.5% breath across the clip)")
         out.append(f"{name!r} doesn't key {desc}, which other clips animate. When a game "
                    f"switches to {name!r}, those keep whatever the previous clip left; key them "
-                   "in every clip (export with export_optimize_animation_size=False and "
-                   "export_optimize_animation_keep_anim_object=True).")
+                   f"in every clip ({'; '.join(fixes)}).")
     return out
 
 
