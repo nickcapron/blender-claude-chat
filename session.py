@@ -149,6 +149,17 @@ reference you imported and then hid stays selected and is exported with the mode
 - When a size or position must match a reference file exactly, copy the coordinate stored \
 in the reference (its vertex, in the same object's local space) rather than typing a \
 rounded figure from the brief: a game may compare the numbers bit for bit.
+- When the project has its own script that checks exported models (sizes, structure, a \
+table of stored values), run that script rather than rewriting its maths yourself: a game \
+engine's rounding can differ from yours in the last digit. If it reads a folder you must \
+not write to, copy the project to bpy.app.tempdir, put your exports in the copy and run it \
+there. If you cannot run it, say so and say the result is unchecked.
+- A check you write yourself against stored values must first reproduce those values on \
+the reference files. If it does not, the check is wrong: fix it or drop it, and do not \
+report a pass from it. Report every mismatch a check prints, however small.
+- bpy.ops.wm.open_mainfile and read_homefile leave the context stale for the rest of that \
+execute_python call (operators fail with "'Context' object has no attribute \
+'active_object'"). End the call after loading a file and run operators in the next one.
 - When a task gives steps to do for each model (views to capture, checks to run), do every \
 step on every model in the batch, the last one as fully as the first. If you leave a step \
 out, say which and why in the final report.
@@ -181,7 +192,10 @@ bpy.ops.wm.save_as_mainfile(filepath=..., copy=True) instead.
 wrong ones. bmesh.ops.inset_individual and inset_region return the new rim faces in 'faces'; \
 the faces you passed in stay as the inner panels. bmesh.ops.bevel replaces the faces next \
 to the edges it bevels, so face references and indices taken before it no longer point at \
-the same faces, and selecting edges by angle after insets also bevels every inset step. For \
+the same faces, and selecting edges by angle after insets also bevels every inset step. \
+The faces it makes can take the mesh's first material instead of the part's: set \
+material_index on the faces it returns in 'faces', and look at one bevelled part that uses \
+another material before you build the rest. For \
 chamfered edges a Bevel modifier (limit method Angle, or Weight on the edges you mark) is \
 simpler; apply it at export. Check the triangle count with measure_model on the first \
 blockout, not after all the detail is in, and add the Bevel modifiers before that count: a \
