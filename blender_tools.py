@@ -317,8 +317,8 @@ TOOL_DEFS = [
         "name": "render_map_test",
         "description": (
             "Render the model as a game draws it on a strategy map: an orthographic view from "
-            "above at the size the spec gives (px_height pixels for the model's height, so "
-            "one pixel is height / px_height), framed so the whole model fits with a margin, "
+            "above at the size the spec gives (px_height pixels for the model's height, or "
+            "px_width pixels for its width on screen), framed so the whole model fits with a margin, "
             "with the dark outline the game adds, over a dark map colour. Returns the image "
             "enlarged pixel for pixel and the model's size in pixels. Uses the scene's render "
             "engine and colour management and its own sun (lighting='scene' uses the scene's "
@@ -328,8 +328,8 @@ TOOL_DEFS = [
             "pixels (those showing a material with emission, found by a second render with "
             "those materials black) and gives their average colour. Also counts the model's bright, saturated "
             "pixels by hue (teal, violet and so on), to show which glows still read. With path "
-            "it tests an exported file. Use it whenever a spec says how many pixels tall the "
-            "game draws the model."
+            "it tests an exported file. Use it whenever a spec says how many pixels tall or "
+            "wide the game draws the model."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -337,11 +337,19 @@ TOOL_DEFS = [
             "properties": {
                 "px_height": {
                     "type": "integer",
-                    "description": "How many pixels tall the spec says the game draws the model (e.g. 30).",
+                    "description": "How many pixels tall the spec says the game draws the model (e.g. 30). Pass this or px_width.",
+                },
+                "px_width": {
+                    "type": "integer",
+                    "description": (
+                        "How many pixels wide the spec says the game draws the model (e.g. 50), "
+                        "instead of px_height: the model's width on screen in the view, the "
+                        "widest of the views when there are several."
+                    ),
                 },
                 "metres_per_px": {
                     "type": "number",
-                    "description": "Size of one pixel in metres, when the spec gives it (e.g. 0.07). Default: the model's height / px_height.",
+                    "description": "Size of one pixel in metres, when the spec gives it (e.g. 0.07). Default: from px_height or px_width.",
                 },
                 "elevation": {
                     "type": "number",
@@ -403,7 +411,6 @@ TOOL_DEFS = [
                     ),
                 },
             },
-            "required": ["px_height"],
             "additionalProperties": False,
         },
     },
@@ -465,9 +472,12 @@ def validate(name, args):
         if tgt is not None and (not isinstance(tgt, str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", tgt.strip())):
             return "target must be a hex colour such as '#9e47ff'."
     elif name == "render_map_test":
-        px = args.get("px_height")
+        sizes = [k for k in ("px_height", "px_width") if args.get(k) is not None]
+        if len(sizes) != 1:
+            return "Pass px_height or px_width (one of them)."
+        px = args[sizes[0]]
         if not isinstance(px, int) or isinstance(px, bool) or not 8 <= px <= 256:
-            return "px_height must be an integer from 8 to 256."
+            return f"{sizes[0]} must be an integer from 8 to 256."
         err = _target_error(args)
         if err:
             return err
@@ -2726,7 +2736,8 @@ def _map_test(args, objs, glb):
 
     scene = bpy.context.scene
     rd = scene.render
-    px_h = int(args["px_height"])
+    px_h = int(args["px_height"]) if args.get("px_height") else None
+    px_w = int(args["px_width"]) if args.get("px_width") else None
     el = math.radians(float(args.get("elevation", 55)))
     az_degs = [float(v) for v in (args.get("azimuths") or [args.get("azimuth", 30)])]
     lighting = args.get("lighting") or "sun"
@@ -2768,9 +2779,28 @@ def _map_test(args, objs, glb):
         H = float(hi[2] - lo[2])
         if H <= 1e-6:
             raise RuntimeError("The model has no height.")
-        mpp = float(args.get("metres_per_px") or H / px_h)
         centre = Vector(((lo + hi) / 2).tolist())
         dist = float(np.linalg.norm(hi - lo)) * 2 + 10
+
+        def direction(a, e):
+            return Vector((math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)))
+
+        # Each view's camera rotation, position and the model's camera-space x/y extent.
+        extents = []
+        for az_deg in az_degs:
+            d = direction(math.radians(az_deg), el)
+            rot = (-d).to_track_quat("-Z", "Y").to_matrix()
+            cam_pos = centre + d * dist
+            Q = (P - np.array(cam_pos)) @ np.array(rot, dtype=np.float64)  # camera x, y, -depth
+            extents.append((rot, cam_pos, float(Q[:, 0].min()), float(Q[:, 0].max()),
+                            float(Q[:, 1].min()), float(Q[:, 1].max())))
+        screen_w = max(e[3] - e[2] for e in extents)
+        if args.get("metres_per_px"):
+            mpp = float(args["metres_per_px"])
+        elif px_w:
+            mpp = screen_w / px_w
+        else:
+            mpp = H / px_h
 
         # The tool's own sun, unless the scene's lights were asked for (and there are any).
         scene_lights = [o for o in scene.objects if o.type == "LIGHT" and not o.hide_render]
@@ -2804,27 +2834,18 @@ def _map_test(args, objs, glb):
         rd.image_settings.file_format = "PNG"
         rd.image_settings.color_mode = "RGBA"
 
-        def direction(a, e):
-            return Vector((math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)))
-
-        # One orthographic camera per view, looking at the model from (azimuth, elevation).
+        # One orthographic camera per view, looking at the model from (azimuth, elevation),
+        # framed on the model's camera-space extent.
         views = []
-        for az_deg in az_degs:
-            d = direction(math.radians(az_deg), el)
-            rot = (-d).to_track_quat("-Z", "Y").to_matrix()
-            cam_pos = centre + d * dist
-            # Camera-space x/y of every point, to frame the model exactly.
-            R = np.array(rot, dtype=np.float64)
-            Q = (P - np.array(cam_pos)) @ R  # columns: camera x, y, -depth
-            x0, x1 = float(Q[:, 0].min()), float(Q[:, 0].max())
-            y0, y1 = float(Q[:, 1].min()), float(Q[:, 1].max())
+        for rot, cam_pos, x0, x1, y0, y1 in extents:
             W = int(math.ceil((x1 - x0) / mpp)) + 2 * MAP_MARGIN_PX
             Ht = int(math.ceil((y1 - y0) / mpp)) + 2 * MAP_MARGIN_PX
             views.append((rot, cam_pos + rot @ Vector(((x0 + x1) / 2, (y0 + y1) / 2, 0)), W, Ht))
         total_w = sum(v[2] for v in views) + MAP_VIEW_GAP_PX * (len(views) - 1)
         if max(total_w, max(v[3] for v in views)) > 1024:
             raise RuntimeError(f"The test would be {total_w}x{max(v[3] for v in views)} px; pass "
-                               "a smaller px_height, a larger metres_per_px or fewer azimuths.")
+                               "a smaller px_height or px_width, a larger metres_per_px or fewer "
+                               "azimuths.")
         shots = []
         for (rot, cam_pos, W, Ht), az_deg, path in zip(views, az_degs, paths):
             cd = bpy.data.cameras.new("claude_map_test_cam")
@@ -2950,15 +2971,21 @@ def _map_test(args, objs, glb):
     az_words = (f"azimuth {az_degs[0]:g} deg (0 = front)" if len(az_degs) == 1 else
                 f"{len(az_degs)} views side by side, left to right at azimuth "
                 + ", ".join(f"{v:g}" for v in az_degs) + " deg (0 = front)")
-    note = (f"Map test: 1 px = {_len(mpp)} (model height {_len(H)} / "
-            f"{'metres_per_px' if args.get('metres_per_px') else str(px_h) + ' px'}), "
+    if args.get("metres_per_px"):
+        scale = "metres_per_px"
+    elif px_w:
+        scale = (f"model width on screen {_len(screen_w)} / {px_w} px"
+                 + (", the widest view" if len(az_degs) > 1 else ""))
+    else:
+        scale = f"model height {_len(H)} / {px_h} px"
+    note = (f"Map test: 1 px = {_len(mpp)} ({scale}), "
             f"orthographic, {math.degrees(el):g} deg above the horizon, {az_words}, "
             + (f"{outline} px dark outline" if outline else "no outline")
             + f", {MAP_MARGIN_PX} px margin, lit by {lit}, view transform {view_used}"
             + ("" if args.get("view_transform") else " (the scene's; pass view_transform to "
                "match the game's tonemapper)")
-            + ". In a view from above the model looks "
-            "taller in pixels than px_height, because its depth shows too.")
+            + (". In a view from above the model looks taller in pixels than px_height, "
+               "because its depth shows too." if px_h and not args.get("metres_per_px") else "."))
     if glb:
         note = (f"{os.path.basename(glb)}, in the pose the file stores (no clip playing). "
                 + note)

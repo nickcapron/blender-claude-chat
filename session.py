@@ -109,11 +109,23 @@ and bake again rather than scaling the baked pixels. Judge a painted colour on t
 surface itself: view_image on the baked texture, or a crop of the render that holds only \
 hull. A whole-model average includes the glows, and a game renderer's ambient light lifts \
 dark paint toward grey whatever its albedo, so darkening the bake to pull that average \
-down only crushes the painted shading, panels and edge wear. If the project has textures \
-for models in the same style (such as *_basecolor.png next to its other models), compare \
-your texture's lightness with theirs, and keep it close unless the spec says otherwise.
+down only crushes the painted shading, panels and edge wear. If the project has finished \
+models in the same style and a command that renders models in the game's renderer, render \
+yours beside one or two of them in the same image (such commands often take several files) \
+and compare how dark the hulls look there. Texture lightness alone doesn't predict it: \
+dark trim, crevices and the size of the panels change how dark a hull reads, so two \
+textures with the same median lightness can look near-black on one model and mid-grey on \
+another. Say which models you compared with.
+- Keep a baked texture's setup so it can be baked again: leave the bake nodes in the \
+material, unlinked from the output, inside a frame node labelled 'bake' (re-link them to \
+bake, then unlink them again), and put the colours and settings the bake used in the \
+frame's label or a text block. A later request to make the paint lighter or darker should \
+change those colours and re-bake, not rebuild the setup from memory: a rebuilt setup \
+changes the grime, mottle and edge wear as well as the colour.
 - When a spec says how many pixels tall or wide a game draws the model, run \
-render_map_test with that size (and metres_per_px if the spec gives a pixel size) rather \
+render_map_test with that size (px_height for a height, px_width for a width, and \
+metres_per_px if the spec gives a pixel size; for a range such as '30 to 70 pixels wide', \
+test both ends with px_width) rather \
 than setting up a camera yourself, and check that the outline and any glowing lines still \
 read: the tool counts the glow pixels (those showing a material with emission) and gives \
 their average colour, and a glow with none (or only one or two) doesn't read. Give that \
@@ -675,7 +687,8 @@ class ChatSession:
             what = args.get("path") or args.get("root") or args.get("collection")
             label = f"measure {os.path.basename(what) if args.get('path') else repr(what)}" if what else "measure model"
         elif name == "render_map_test" and isinstance(args, dict):
-            label = f"map test at {args.get('px_height')} px"
+            label = (f"map test at {args['px_width']} px wide" if args.get("px_width")
+                     else f"map test at {args.get('px_height')} px")
             if args.get("path"):
                 label += f" of {os.path.basename(args['path'])}"
         elif name == "view_image" and isinstance(args, dict) and args.get("crop"):
