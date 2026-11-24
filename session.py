@@ -140,6 +140,19 @@ the new export) and give the new count. Details under about one pixel wide disap
 angle, keep the tool's default and say which angle you used. Report the pixel size the tool \
 gives, not the spec's figure. When the spec asks for a strong silhouette, thicken parts that come out under a pixel \
 (legs, antennas, masts) rather than letting them vanish.
+- Judge the outline from each view the game uses, not only the preview's. A camera pitched \
+down onto a model (a strategy map's 20 to 30 degrees) shows its top faces: a wide flat top \
+takes most of the picture and what hangs under it reads as a fringe, while a title or hero \
+shot from level or below shows the opposite. When the model's main feature hangs below or \
+sits behind a large slab, run the map test at the game's angle on the first blockout and \
+lengthen or thicken the feature until it holds its share of the outline there.
+- A size limit in a spec ('no more than 3 m tall, or it is cut off') is often the brief \
+writer's guess about how the game fits the model. If the limit is what keeps a main \
+feature from reading and you can read the game's code or docs, find how it scales the \
+model (by height, by its longest horizontal side, into what cell) and work out what fits. \
+Otherwise keep to the limit and tell the user which feature it holds back, with the pixel \
+sizes from the map test. A model that grows taller can run into labels the game draws \
+beside it, so say when you changed a proportion.
 - After the first blockout render, judge the whole model against the spec's words for the \
 subject and mood (a creature or a machine, 'menacing', 'never toy-like'), not only its \
 checklist. If it reads as something else (boxes stacked on a creature read as cargo crates), \
@@ -150,6 +163,11 @@ and say how in your final reply.
 flags an offset): move the root object or armature, not mesh data inside an animated \
 hierarchy, and say whether you centred the bounding box or the points it stands on. A long \
 tail or abdomen pulls the bounding box well behind the feet.
+- The tools call -Y the model's front: render_map_test's azimuth 0 looks at the -Y side, \
+and 'front', 'behind' and 'forward' in measure_model and check_ground_contact mean -Y and \
++Y. When a spec puts the nose elsewhere (a ship with its prow at +Y), work out camera \
+azimuths and read those words from the spec's axis, and say in your reply which way the \
+model faces in the file.
 - Fix and check geometry while a model is still separate parts, then join, UV-unwrap and \
 bake. Once parts are joined you can't select one by name or by its old bounding box. If you \
 change the mesh after a bake, bake again; otherwise the baked shading and grime no longer \
@@ -298,6 +316,20 @@ KHR_animation_pointer): the exporter still drops one that stays constant in a cl
 a change too small to see (a 0.5% breath across the clip) so every clip keys it. \
 measure_model with path reports channels some clips key and others don't, material \
 channels included.
+- A glow that pulses in a clip needs two checks on the exported file. The exporter writes \
+each material as it stands on the frame of the export, so a glow caught mid-pulse gets \
+that dimmer value as its resting strength (what a game shows where no clip plays): compare \
+the file's emissiveFactor and emissiveStrength with the spec's. And it writes the pulse as \
+an animated emissiveFactor, a colour, whenever colour times strength stays at or under 1. \
+Godot 4.7 plays that channel but skips the colour conversion a still material gets, so the \
+glow changes hue while a clip plays (#C08CFF plays as #8742FF) and looks right at rest. A \
+game-renderer check of the rest pose misses it: look at a frame with the clip playing, or \
+read the animation's pointers in the file. What worked was a fix in the .glb itself: point \
+each such channel at /extensions/KHR_materials_emissive_strength/emissiveStrength with \
+plain numbers (the pulse as a share of the resting strength), give the material that \
+extension, and leave emissiveFactor still; Godot then plays the pulse as emission energy \
+and the colour holds. Tell the user if you did this, and if you could not, that the pulse \
+shifts the glow's colour in Godot.
 
 Finishing a task:
 - When the task comes from a written spec or checklist, go back through it item by item \
